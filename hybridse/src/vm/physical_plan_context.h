@@ -19,12 +19,14 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "base/fe_status.h"
 #include "node/node_manager.h"
 #include "udf/udf_library.h"
+#include "vm/engine_context.h"
 
 namespace hybridse {
 namespace vm {
@@ -33,17 +35,18 @@ using hybridse::base::Status;
 
 class PhysicalPlanContext {
  public:
-    PhysicalPlanContext(node::NodeManager* nm, const udf::UdfLibrary* library,
-                        const std::string& db,
-                        const std::shared_ptr<Catalog>& catalog,
-                        const codec::Schema* parameter_types,
-                        bool enable_expr_opt)
+    PhysicalPlanContext(node::NodeManager* nm, const udf::UdfLibrary* library, const std::string& db,
+                        const std::shared_ptr<Catalog>& catalog, const codec::Schema* parameter_types,
+                        bool enable_expr_opt, const std::unordered_map<std::string, std::string>* options = nullptr,
+                        std::shared_ptr<IndexHintHandler> index_hints = nullptr)
         : nm_(nm),
           library_(library),
           db_(db),
           catalog_(catalog),
           parameter_types_(parameter_types),
-          enable_expr_opt_(enable_expr_opt) {}
+          enable_expr_opt_(enable_expr_opt),
+          options_(options),
+          index_hints_(index_hints) {}
     ~PhysicalPlanContext() {}
 
     /**
@@ -117,6 +120,10 @@ class PhysicalPlanContext {
         return WithNewChildren(input, children, out);
     }
 
+    const std::unordered_map<std::string, std::string>* GetOptions() const {
+        return options_;
+    }
+
     node::NodeManager* node_manager() const { return nm_; }
     const udf::UdfLibrary* library() const { return library_; }
     const std::string& db() { return db_; }
@@ -125,6 +132,8 @@ class PhysicalPlanContext {
     // temp dict for legacy udf
     // TODO(xxx): support udf type infer
     std::map<std::string, type::Type> legacy_udf_dict_;
+
+    std::shared_ptr<IndexHintHandler> index_hints() { return index_hints_; }
 
  private:
     node::NodeManager* nm_;
@@ -152,6 +161,11 @@ class PhysicalPlanContext {
     size_t codegen_func_id_counter_ = 0;
 
     bool enable_expr_opt_ = false;
+    const std::unordered_map<std::string, std::string>* options_ = nullptr;
+
+    // possible index suggestion to optimize the query performance
+    // not standardized, maybe Diagnostic info ?
+    std::shared_ptr<IndexHintHandler> index_hints_;
 };
 }  // namespace vm
 }  // namespace hybridse

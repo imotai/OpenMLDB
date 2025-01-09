@@ -17,9 +17,12 @@
 #ifndef SRC_BASE_FILE_UTIL_H_
 #define SRC_BASE_FILE_UTIL_H_
 
+#include <absl/strings/match.h>
+#include <absl/strings/str_cat.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -28,7 +31,7 @@
 #include <string>
 #include <vector>
 
-#include "base/glog_wapper.h"  // NOLINT
+#include "base/glog_wrapper.h"
 
 namespace openmldb {
 namespace base {
@@ -96,6 +99,26 @@ inline static int GetSubDir(const std::string& path,
         if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0) {
             continue;
         } else if (ptr->d_type == DT_DIR) {
+            sub_dir.push_back(ptr->d_name);
+        }
+    }
+    closedir(dir);
+    return 0;
+}
+
+inline static int GetSubFiles(const std::string& path, std::vector<std::string>& sub_dir) {  // NOLINT
+    if (path.empty()) {
+        return -1;
+    }
+    DIR* dir = opendir(path.c_str());
+    if (dir == NULL) {
+        return -1;
+    }
+    struct dirent* ptr;
+    while ((ptr = readdir(dir)) != NULL) {
+        if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0) {
+            continue;
+        } else if (ptr->d_type == DT_REG) {
             sub_dir.push_back(ptr->d_name);
         }
     }
@@ -229,6 +252,18 @@ inline static std::string ParseFileNameFromPath(const std::string& path) {
     return path.substr(index, path.length() - index);
 }
 
+inline static std::string ParseParentDirFromPath(const std::string& path) {
+    std::string full_path = path;
+    if (full_path.size() > 1 && full_path.back() == '/') {
+        full_path.pop_back();
+    }
+    size_t index = full_path.rfind('/');
+    if (index == std::string::npos) {
+        return "./";
+    }
+    return full_path.substr(0, index + 1);
+}
+
 static bool GetDirSizeRecur(const std::string& path,
                             uint64_t& size) {  // NOLINT
     std::vector<std::string> file_vec;
@@ -285,6 +320,74 @@ __attribute__((unused)) static bool CopyFile(const std::string& src_file, const 
     fclose(f_src);
     fclose(f_desc);
     return has_error == false;
+}
+
+inline static int HardLinkDir(const std::string& src, const std::string& dest) {
+    if (!IsExists(src)) {
+        LOG(WARNING) << "src not exists " << src;
+        return -2;
+    }
+
+    if (IsExists(dest)) {
+        RemoveDirRecursive(dest);
+    }
+
+    if (!MkdirRecur(dest)) {
+        LOG(WARNING) << "mkdir failed " << dest;
+        return -3;
+    }
+    std::vector<std::string> files;
+    if (GetSubFiles(src, files) != 0) {
+        LOG(WARNING) << "get sub files failed " << src;
+        return -4;
+    }
+
+    for (const auto& file : files) {
+        int ret = link((src + "/" + file).c_str(), (dest + "/" + file).c_str());
+        if (ret) {
+            LOG(WARNING) << "link failed " << src << "/" << file << " " << dest << "/" << file;
+            return ret;
+        }
+    }
+    return 0;
+}
+
+// list of paths of all files match the pattern `path`
+// do not include any subfolder
+inline static std::vector<std::string> FindFiles(const std::string& path) {
+    std::string pattern;
+    const std::string file_prefix = "file://";
+    if (absl::StartsWith(path, file_prefix)) {
+        pattern = path.substr(file_prefix.size());
+    } else {
+        pattern = path;
+    }
+
+    if (IsFolder(pattern)) {
+        pattern = absl::StrCat(pattern, "/*");
+    }
+    glob_t glob_result;
+    memset(&glob_result, 0, sizeof(glob_result));
+
+    int return_value = glob(pattern.c_str(), GLOB_TILDE, NULL, &glob_result);
+    if (return_value != 0) {
+        globfree(&glob_result);
+        return {};
+    }
+
+    std::vector<std::string> filenames;
+    for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
+        std::string filename = glob_result.gl_pathv[i];
+        if (!IsFolder(filename)) {
+            filenames.push_back(filename);
+        }
+    }
+
+    // cleanup
+    globfree(&glob_result);
+
+    // done
+    return filenames;
 }
 
 }  // namespace base

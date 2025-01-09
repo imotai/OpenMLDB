@@ -183,8 +183,10 @@ void SumArrayListCol(benchmark::State* state, MODE mode, int64_t data_size,
         schemas_context.GetRowFormat(schema_idx)->GetColumnInfo(col_idx);
 
     codegen::MemoryWindowDecodeIRBuilder builder(&schemas_context, nullptr);
-    node::TypeNode type;
-    codegen::SchemaType2DataType(info->type, &type);
+    node::NodeManager nm;
+    auto rs = codegen::ColumnSchema2Type(info->schema, &nm);
+    ASSERT_TRUE(rs.ok());
+    auto* type = rs.value();
 
     uint32_t col_size;
     ASSERT_TRUE(codegen::GetLlvmColumnSize(&type, &col_size));
@@ -193,7 +195,7 @@ void SumArrayListCol(benchmark::State* state, MODE mode, int64_t data_size,
 
     ASSERT_EQ(0, ::hybridse::codec::v1::GetCol(
                      reinterpret_cast<int8_t*>(&list_table_ref), 0, info->idx,
-                     info->offset, info->type, buf));
+                     info->offset, info->type(), buf));
 
     {
         switch (mode) {
@@ -476,7 +478,7 @@ int32_t RunByteMemPoolAlloc1000(size_t request_size) {
     return 1;
 }
 int32_t RunNewFree1000(size_t request_size) {
-    hybridse::base::ByteMemoryPool pool;
+    openmldb::base::ByteMemoryPool pool;
     std::vector<char*> chucks;
     for (int i = 0; i < 1000; i++) {
         chucks.push_back(new char[request_size]);

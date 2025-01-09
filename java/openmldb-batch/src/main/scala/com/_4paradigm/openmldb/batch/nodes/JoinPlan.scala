@@ -19,10 +19,11 @@ package com._4paradigm.openmldb.batch.nodes
 import com._4paradigm.hybridse.`type`.TypeOuterClass.ColumnDef
 import com._4paradigm.hybridse.codec
 import com._4paradigm.hybridse.codec.RowView
-import com._4paradigm.hybridse.sdk.{HybridSeException, JitManager, SerializableByteBuffer}
-import com._4paradigm.hybridse.node.{ExprListNode, JoinType}
+import com._4paradigm.hybridse.sdk.{HybridSeException, JitManager, SerializableByteBuffer, UnsupportedHybridSeException}
+import com._4paradigm.hybridse.node.{BinaryExpr, ExprListNode, ExprType, FnOperator, JoinType}
 import com._4paradigm.hybridse.vm.{CoreAPI, HybridSeJitWrapper, PhysicalJoinNode}
-import com._4paradigm.openmldb.batch.utils.{HybridseUtil, SparkColumnUtil, SparkRowUtil, SparkUtil}
+import com._4paradigm.openmldb.batch.utils.{ExpressionUtil, ExternalUdfUtil, HybridseUtil, SparkColumnUtil,
+  SparkRowUtil, SparkUtil}
 import com._4paradigm.openmldb.batch.{PlanContext, SparkInstance, SparkRowCodec}
 import com._4paradigm.openmldb.sdk.impl.SqlClusterExecutor
 import org.apache.spark.sql.types.StructType
@@ -53,7 +54,8 @@ object JoinPlan {
     // TODO: Do not handle dataframe with index because ConcatJoin will not include LastJoin or LeftJoin node
     val rightDf = right.getDf()
 
-    val inputSchemaSlices = HybridseUtil.getOutputSchemaSlices(node)
+    val isUnsafeRowOpt = ctx.getConf.enableUnsafeRowOptimization
+    val inputSchemaSlices = HybridseUtil.getOutputSchemaSlices(node, isUnsafeRowOpt)
 
     val hasOrderby =
       ((node.join.right_sort != null) && (node.join.right_sort.orders != null)
@@ -66,6 +68,8 @@ object JoinPlan {
 
     val indexName = "__JOIN_INDEX__" + System.currentTimeMillis()
 
+    var hasIndexColumn = false
+
     val leftDf: DataFrame = {
       if (joinType == JoinType.kJoinTypeLeft) {
         left.getDf()
@@ -73,6 +77,7 @@ object JoinPlan {
         if (supportNativeLastJoin && ctx.getConf.enableNativeLastJoin) {
           left.getDf()
         } else {
+          hasIndexColumn = true
           // Add index column for original last join, not used in native last join
           SparkUtil.addIndexColumn(spark, left.getDf(), indexName, ctx.getConf.addIndexColumnMethod)
         }
@@ -95,41 +100,56 @@ object JoinPlan {
       }
     }
 
-    val indexColIdx = if (joinType == JoinType.kJoinTypeLast) {
-      leftDf.schema.size - 1
-    } else if (supportNativeLastJoin && ctx.getConf.enableNativeLastJoin) {
+    val indexColIdx = if (hasIndexColumn) {
       leftDf.schema.size - 1
     } else {
-      leftDf.schema.size
+      -1
     }
 
     val filter = node.join().condition()
     // extra conditions
     if (filter.condition() != null) {
-      val regName = "SPARKFE_JOIN_CONDITION_" + filter.fn_info().fn_name()
-      val conditionUDF = new JoinConditionUDF(
-        functionName = filter.fn_info().fn_name(),
-        inputSchemaSlices = inputSchemaSlices,
-        outputSchema = filter.fn_info().fn_schema(),
-        moduleTag = ctx.getTag,
-        moduleBroadcast = ctx.getSerializableModuleBuffer,
-        hybridseJsdkLibraryPath = ctx.getConf.openmldbJsdkLibraryPath
-      )
-      spark.udf.register(regName, conditionUDF)
-
-      // Handle the duplicated column names to get Spark Column by index
-      val allColumns = new mutable.ArrayBuffer[Column]()
-      for (i <- leftDf.schema.indices) {
-        if (i != indexColIdx) {
-          allColumns += SparkColumnUtil.getColumnFromIndex(leftDf, i)
+      if (ctx.getConf.enableJoinWithSparkExpr) {
+        joinConditions += ExpressionUtil.recursiveGetSparkColumnFromExpr(filter.condition(), node, leftDf, rightDf,
+          hasIndexColumn)
+        logger.info("Generate spark join conditions: " + joinConditions)
+      } else { // Disable join with native expression, use encoder/decoder and jit function
+        val regName = "SPARKFE_JOIN_CONDITION_" + filter.fn_info().fn_name()
+        var externalFunMap = Map[String, com._4paradigm.openmldb.proto.Common.ExternalFun]()
+        val openmldbSession = ctx.getOpenmldbSession
+        if (ctx.getConf.openmldbZkCluster.nonEmpty && ctx.getConf.openmldbZkRootPath.nonEmpty
+          && openmldbSession != null && openmldbSession.openmldbCatalogService != null) {
+          externalFunMap = openmldbSession.openmldbCatalogService.getExternalFunctionsMap()
         }
-      }
-      for (i <- rightDf.schema.indices) {
-        allColumns += SparkColumnUtil.getColumnFromIndex(rightDf, i)
+        val conditionUDF = new JoinConditionUDF(
+          functionName = filter.fn_info().fn_name(),
+          inputSchemaSlices = inputSchemaSlices,
+          outputSchema = filter.fn_info().fn_schema(),
+          moduleTag = ctx.getTag,
+          moduleBroadcast = ctx.getSerializableModuleBuffer,
+          hybridseJsdkLibraryPath = ctx.getConf.openmldbJsdkLibraryPath,
+          ctx.getConf.enableUnsafeRowOptimization,
+          externalFunMap,
+          ctx.getConf.taskmanagerExternalFunctionDir,
+          ctx.getSparkSession.conf.get("spark.master").equalsIgnoreCase("yarn")
+        )
+        spark.udf.register(regName, conditionUDF)
+
+        // Handle the duplicated column names to get Spark Column by index
+        val allColumns = new mutable.ArrayBuffer[Column]()
+        for (i <- leftDf.schema.indices) {
+          if (i != indexColIdx) {
+            allColumns += SparkColumnUtil.getColumnFromIndex(leftDf, i)
+          }
+        }
+        for (i <- rightDf.schema.indices) {
+          allColumns += SparkColumnUtil.getColumnFromIndex(rightDf, i)
+        }
+
+        val allColWrap = functions.struct(allColumns: _*)
+        joinConditions += functions.callUDF(regName, allColWrap)
       }
 
-      val allColWrap = functions.struct(allColumns: _*)
-      joinConditions += functions.callUDF(regName, allColWrap)
     }
 
     if (joinConditions.isEmpty) {
@@ -197,13 +217,18 @@ object JoinPlan {
                          outputSchema: java.util.List[ColumnDef],
                          moduleTag: String,
                          moduleBroadcast: SerializableByteBuffer,
-                         hybridseJsdkLibraryPath: String
+                         hybridseJsdkLibraryPath: String,
+                         isUnsafeRowOpt: Boolean,
+                         externalFunMap: Map[String, com._4paradigm.openmldb.proto.Common.ExternalFun],
+                         taskmanagerExternalFunctionDir: String,
+                         isYarnMode: Boolean
                         ) extends Function1[Row, Boolean] with Serializable {
 
     @transient private lazy val tls = new ThreadLocal[UnSafeJoinConditionUDFImpl]() {
       override def initialValue(): UnSafeJoinConditionUDFImpl = {
         new UnSafeJoinConditionUDFImpl(
-          functionName, inputSchemaSlices, outputSchema, moduleTag, moduleBroadcast, hybridseJsdkLibraryPath)
+          functionName, inputSchemaSlices, outputSchema, moduleTag, moduleBroadcast, hybridseJsdkLibraryPath,
+          isUnsafeRowOpt, externalFunMap, taskmanagerExternalFunctionDir, isYarnMode)
       }
     }
 
@@ -217,7 +242,11 @@ object JoinPlan {
                                    outputSchema: java.util.List[ColumnDef],
                                    moduleTag: String,
                                    moduleBroadcast: SerializableByteBuffer,
-                                   openmldbJsdkLibraryPath: String
+                                   openmldbJsdkLibraryPath: String,
+                                   isUnafeRowOpt: Boolean,
+                                   externalFunMap: Map[String, com._4paradigm.openmldb.proto.Common.ExternalFun],
+                                   taskmanagerExternalFunctionDir: String,
+                                   isYarnMode: Boolean
                                   ) extends Function1[Row, Boolean] with Serializable {
     private val jit = initJIT()
 
@@ -231,11 +260,14 @@ object JoinPlan {
     private val outView: RowView = new RowView(outputSchema)
 
     def initJIT(): HybridSeJitWrapper = {
+      // before jit, more init
+      SqlClusterExecutor.initJavaSdkLibrary(openmldbJsdkLibraryPath)
+
+      // Load external udf if exists
+      ExternalUdfUtil.executorRegisterExternalUdf(externalFunMap, taskmanagerExternalFunctionDir, isYarnMode)
       // ensure worker native
       val buffer = moduleBroadcast.getBuffer
-      SqlClusterExecutor.initJavaSdkLibrary(openmldbJsdkLibraryPath)
-      JitManager.initJitModule(moduleTag, buffer)
-
+      JitManager.initJitModule(moduleTag, buffer, isUnafeRowOpt)
       JitManager.getJit(moduleTag)
     }
 

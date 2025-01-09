@@ -16,23 +16,23 @@
 
 package com._4paradigm.openmldb.batchjob
 
-import com._4paradigm.openmldb.batch.api.OpenmldbSession
+import com._4paradigm.openmldb.batchjob.util.OpenmldbJobUtil
 import org.apache.spark.sql.SparkSession
 
 object ImportOfflineData {
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 1) {
-      throw new Exception(s"Require args: sql but get args: ${args.mkString(",")}")
-    }
-
+    // sql
+    OpenmldbJobUtil.checkArgumentSize(args, 1)
     importOfflineData(args(0))
   }
 
-  def importOfflineData(sql: String): Unit = {
-    val sess = new OpenmldbSession(SparkSession.builder().getOrCreate())
-    sess.sql(sql)
-    sess.close()
+  def importOfflineData(sqlFilePath: String): Unit = {
+    // No need to use `enableHiveSupport` create session, just enabled by config `spark.sql.catalogImplementation=hive`
+    // If spark has no hive jars, throws exception
+    val builder = SparkSession.builder()
+    val spark = builder.getOrCreate()
+    OpenmldbJobUtil.runOpenmldbSql(spark, sqlFilePath)
   }
 
 }

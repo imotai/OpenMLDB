@@ -16,20 +16,21 @@
 
 package com._4paradigm.openmldb.batchjob
 
-import com._4paradigm.openmldb.batch.api.OpenmldbSession
+import com._4paradigm.openmldb.batchjob.util.OpenmldbJobUtil
 import org.apache.spark.sql.SparkSession
 
 object ExportOfflineData {
-  def main(args: Array[String]): Unit = {
-    if (args.length < 1) {
-      throw new Exception(s"Require args: sql but get args: ${args.mkString(",")}")
-    }
 
+  def main(args: Array[String]): Unit = {
+    // sql
+    OpenmldbJobUtil.checkArgumentSize(args, 1)
     exportOfflineData(args(0))
   }
 
-  def exportOfflineData(sql: String): Unit = {
-    val spark = new OpenmldbSession(SparkSession.builder().getOrCreate())
-    spark.sql(sql)
+  def exportOfflineData(sqlFilePath: String): Unit = {
+    val builder = SparkSession.builder()
+    val spark = builder.getOrCreate()
+    OpenmldbJobUtil.runOpenmldbSql(spark, sqlFilePath)
   }
+
 }

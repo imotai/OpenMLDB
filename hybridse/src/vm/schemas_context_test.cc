@@ -152,7 +152,7 @@ void CheckColumnResolveCase(const YAML::Node& resolve_case,
 }
 
 void CheckColumnResolveCases(const SqlCase& sql_case, PhysicalOpNode* node) {
-    LOG(INFO) << "Physical plan:\n" << node->SchemaToString();
+    LOG(INFO) << "Physical plan:\n" << node->SchemaToString("");
 
     auto& raw_node = sql_case.raw_node();
     const auto& expect = raw_node["expect"];
@@ -192,7 +192,7 @@ PhysicalOpNode* GetTestSqlPlan(SqlCase& sql_case,  // NOLINT
 INSTANTIATE_TEST_SUITE_P(
     ResolveNameTest, SchemasContextResolveTest,
     testing::ValuesIn(
-        sqlcase::InitCases("/cases/plan/schemas_context/resolve_column_name.yaml")));
+        sqlcase::InitCases("cases/plan/schemas_context/resolve_column_name.yaml")));
 
 TEST_P(SchemasContextResolveTest, test_request_column_resolve) {
     SqlCase sql_case = GetParam();

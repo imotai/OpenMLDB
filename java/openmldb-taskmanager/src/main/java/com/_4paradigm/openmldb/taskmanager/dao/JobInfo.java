@@ -128,16 +128,26 @@ public class JobInfo {
 
     @Override
     public String toString() {
-        return String.format("id: %d, jobType: %s, state: %s, parameter: %s, cluster: %s, applicationId: %s, error: %s",
-                id, jobType, state, parameter, cluster, applicationId, error);
+        return String.format("id: %d, jobType: %s, state: %s, startTime: %s, endTime: %s parameter: %s, cluster: %s," +
+                        " applicationId: %s, error: %s",
+                id, jobType, state, startTime.toString(), endTime == null ? "": endTime.toString(), parameter, cluster,
+                applicationId, error);
     }
 
     public boolean isFinished() {
         return Arrays.asList(FINAL_STATE).contains(state.toLowerCase());
     }
 
+    public boolean isSuccess() {
+        return state.toLowerCase().equals("finished");
+    }
+
     public boolean isYarnJob() {
-        return cluster.toLowerCase().equals("yarn");
+        return cluster.toLowerCase().startsWith("yarn");
+    }
+
+    public boolean isYarnClusterJob() {
+        return cluster.equalsIgnoreCase("yarn") || cluster.equalsIgnoreCase("yarn-cluster");
     }
 
     public void sync() {

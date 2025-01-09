@@ -18,8 +18,8 @@
 #include <string>
 #include <vector>
 
-#include "base/kv_iterator.h"
 #include "boost/container/deque.hpp"
+#include "codec/encrypt.h"
 #include "codec/row_codec.h"
 #include "gtest/gtest.h"
 #include "proto/common.pb.h"
@@ -35,31 +35,21 @@ class CodecTest : public ::testing::Test {
     ~CodecTest() {}
 };
 
-TEST_F(CodecTest, EncodeRows_empty) {
-    boost::container::deque<std::pair<uint64_t, ::openmldb::base::Slice>> data;
-    std::string pairs;
-    int32_t size = ::openmldb::codec::EncodeRows(data, 0, &pairs);
-    ASSERT_EQ(size, 0);
-}
-
-TEST_F(CodecTest, EncodeRows_invalid) {
-    boost::container::deque<std::pair<uint64_t, ::openmldb::base::Slice>> data;
-    int32_t size = ::openmldb::codec::EncodeRows(data, 0, NULL);
-    ASSERT_EQ(size, -1);
-}
-
 TEST_F(CodecTest, EncodeRows) {
     boost::container::deque<std::pair<uint64_t, ::openmldb::base::Slice>> data;
     std::string test1 = "value1";
     std::string test2 = "value2";
     std::string empty;
-    uint32_t total_block_size = test1.length() + test2.length() + empty.length();
     data.emplace_back(1, std::move(::openmldb::base::Slice(test1.c_str(), test1.length())));
     data.emplace_back(2, std::move(::openmldb::base::Slice(test2.c_str(), test2.length())));
     data.emplace_back(3, std::move(::openmldb::base::Slice(empty.c_str(), empty.length())));
+    butil::IOBuf buf;
+    for (const auto& pair : data) {
+        Encode(pair.first, pair.second.data(), pair.second.size(), &buf);
+    }
     std::string pairs;
-    int32_t size = ::openmldb::codec::EncodeRows(data, total_block_size, &pairs);
-    ASSERT_EQ(size, 3 * 12 + 6 + 6);
+    buf.copy_to(&pairs);
+    ASSERT_EQ(pairs.size(), 3 * 12 + 6 + 6);
     std::vector<std::pair<uint64_t, std::string*>> new_data;
     ::openmldb::codec::Decode(&pairs, new_data);
     ASSERT_EQ(data.size(), new_data.size());
@@ -141,7 +131,7 @@ TEST_F(CodecTest, Normal) {
     ASSERT_EQ(view.GetInt64(4, &val2), 0);
     ASSERT_EQ(val2, 5);
 
-    builder.SetInt64(4, 10);
+    ASSERT_TRUE(builder.SetInt64(4, 10));
     int64_t val3 = 0;
     ASSERT_EQ(view.GetInt64(4, &val3), 0);
     ASSERT_EQ(val3, 10);
@@ -458,7 +448,7 @@ TEST_F(CodecTest, NotAppendString) {
     builder.SetBuffer(reinterpret_cast<int8_t*>(&(row[0])), size);
     for (int i = 0; i < 8; i++) {
         if (i > 2 && i < 6) {
-            builder.AppendNULL();
+            ASSERT_TRUE(builder.AppendNULL());
             continue;
         }
         std::string str(10, 'a' + i);
@@ -480,6 +470,83 @@ TEST_F(CodecTest, NotAppendString) {
     }
     int16_t val = 0;
     ASSERT_EQ(view.GetInt16(10, &val), -1);
+}
+
+TEST_F(CodecTest, RowBuilderSet) {
+    Schema schema;
+    ::openmldb::common::ColumnDesc* col = schema.Add();
+    col->set_name("col1");
+    col->set_data_type(::openmldb::type::kInt);
+    col = schema.Add();
+    col->set_name("col2");
+    col->set_data_type(::openmldb::type::kSmallInt);
+    col = schema.Add();
+    col->set_name("col3");
+    col->set_data_type(::openmldb::type::kFloat);
+    col = schema.Add();
+    col->set_name("col4");
+    col->set_data_type(::openmldb::type::kDouble);
+    col = schema.Add();
+    col->set_name("col5");
+    col->set_data_type(::openmldb::type::kBigInt);
+    col = schema.Add();
+    col->set_name("col6");
+    col->set_data_type(::openmldb::type::kString);
+    col = schema.Add();
+    col->set_name("col7");
+    col->set_data_type(::openmldb::type::kString);
+    col = schema.Add();
+    col->set_name("col8");
+    col->set_data_type(::openmldb::type::kTimestamp);
+    RowBuilder builder(schema);
+    uint32_t size = builder.CalTotalLength(6);
+    std::string row;
+    row.resize(size);
+    int8_t* row_ptr = reinterpret_cast<int8_t*>(&(row[0]));
+    std::string st("string");
+    builder.InitBuffer(row_ptr, size, true);
+    ASSERT_TRUE(builder.SetInt32(row_ptr, 0, 1));
+    ASSERT_TRUE(builder.SetInt16(row_ptr, 1, 2));
+    ASSERT_TRUE(builder.SetFloat(row_ptr, 2, 1.3));
+    ASSERT_TRUE(builder.SetDouble(row_ptr, 3, 2.3));
+    ASSERT_TRUE(builder.SetInt64(row_ptr, 4, 5));
+    ASSERT_TRUE(builder.SetNULL(row_ptr, size, 5));
+    ASSERT_TRUE(builder.SetString(row_ptr, size, 6, "string", 6));
+    ASSERT_FALSE(builder.SetTimestamp(row_ptr, 7, -123));
+    ASSERT_TRUE(builder.SetTimestamp(row_ptr, 7, 1668149927000));
+    RowView view(schema, row_ptr, size);
+    int32_t val = 0;
+    ASSERT_EQ(view.GetInt32(0, &val), 0);
+    ASSERT_EQ(val, 1);
+    int16_t val1 = 0;
+    ASSERT_EQ(view.GetInt16(1, &val1), 0);
+    ASSERT_EQ(val1, 2);
+    float val2 = 0;
+    ASSERT_EQ(view.GetFloat(2, &val2), 0);
+    ASSERT_TRUE(abs(val2 - 1.3) < 0.00001);
+    double val3 = 0;
+    ASSERT_EQ(view.GetDouble(3, &val3), 0);
+    ASSERT_TRUE(abs(val3 - 2.3) < 0.00001);
+    int64_t val4 = 0;
+    ASSERT_EQ(view.GetInt64(4, &val4), 0);
+    ASSERT_EQ(val4, 5);
+    char* ch = NULL;
+    uint32_t ch_length = 0;
+    ASSERT_EQ(view.GetString(5, &ch, &ch_length), 1);
+    ASSERT_EQ(view.GetString(6, &ch, &ch_length), 0);
+    ASSERT_EQ(ch_length, 6);
+    std::string ret(ch, ch_length);
+    ASSERT_EQ(ret, st);
+    int64_t ts = 0;
+    ASSERT_EQ(view.GetTimestamp(7, &ts), 0);
+    ASSERT_EQ(ts, 1668149927000);
+}
+
+TEST_F(CodecTest, Encrypt) {
+    ASSERT_EQ(SHA256("root"), "4813494d137e1631bba301d5acab6e7bb7aa74ce1185d456565ef51d737677b2");
+    ASSERT_EQ(SHA256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    ASSERT_EQ(Encrypt("root"), "14813494d137e1631bba301d5acab6e7bb7aa74ce1185d456565ef51d737677b2");
+    ASSERT_EQ(Encrypt(""), "1e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
 }  // namespace codec

@@ -19,18 +19,19 @@ package com._4paradigm.openmldb.batch
 import java.util.Properties
 
 import com._4paradigm.openmldb.batch.api.OpenmldbSession
-import com._4paradigm.openmldb.batch.nodes.LoadDataPlan.autoLoad
-import com._4paradigm.openmldb.proto.{Common, NS, Type}
+import com._4paradigm.openmldb.proto.NS
 import com._4paradigm.openmldb.sdk.impl.SqlClusterExecutor
+import org.apache.spark.SparkException
 import org.scalatest.Matchers
-
 import scala.language.postfixOps
+import scala.collection.JavaConverters.asScalaBufferConverter
+
 
 class TestLoadDataPlan extends SparkTestSuite with Matchers {
   var openmldbSession: OpenmldbSession = _
   var openmldbConnector: SqlClusterExecutor = _
   val db = "batch_test"
-  val table = "load_data_test"
+  var table: String = _
 
   override def customizedBefore(): Unit = {
     // load data needs openmldb cluster
@@ -46,12 +47,15 @@ class TestLoadDataPlan extends SparkTestSuite with Matchers {
     openmldbConnector = openmldbSession.openmldbCatalogService.sqlExecutor
 
     openmldbConnector.createDB(db)
-    // to ensure the offline info is unset
-    // TODO(hw): test openmldb cluster doesn't have task manager now, so drop table will fail
-    //  DO NOT run offline test until task manager works in test env.
-    openmldbConnector.executeDDL(db, s"drop table $table;")
+
+    // NOTICE: test openmldb cluster doesn't have task manager now, so drop table will fail
+    // To ensure the offline info is unset, we use unique table names. But we can't do cleanup.
+    table = "load_data_test" + java.time.Instant.now.toEpochMilli
+    println(s"load test on $db.$table")
+    assert(!tableExists(db, table))
+
     openmldbConnector.executeDDL(db, s"create table $table(c1 int, c2 int64, " +
-      s"c3 double);")
+      s"c3 double not null);")
     assert(tableExists(db, table))
   }
 
@@ -70,134 +74,138 @@ class TestLoadDataPlan extends SparkTestSuite with Matchers {
     val sess = getSparkSession
     val planner = new SparkPlanner(sess)
     val t1 = sess.emptyDataFrame
-    try {
+    a[IllegalArgumentException] should be thrownBy {
       planner.plan("load data infile 'foo.txt' into table t1;", Map("t1" -> t1))
       fail("unreachable")
-    } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
     }
   }
 
-  test("Test Load Type Timestamp") {
-    val col = Common.ColumnDesc.newBuilder().setName("ts").setDataType(Type.DataType.kTimestamp).build()
-    val cols = new java.util.ArrayList[Common.ColumnDesc]
-    cols.add(col)
-
-    val testFile = "file://" + getClass.getResource("/load_data_test_src/sql_timestamp.csv").getPath
-    val df = autoLoad(cols, getSparkSession.read.format("csv").option("header", "true").option("nullValue", "null"),
-      testFile)
-    df.show()
-    val l = df.select("ts").rdd.map(r => r(0)).collect.toList
-    l.toString() should equal ("List(null, 1970-01-01 00:00:00.0, null, null, 2022-02-01 09:00:00.0)")
-
-    val testFile2 = "file://" + getClass.getResource("/load_data_test_src/long_timestamp.csv").getPath
-    val df2 = autoLoad(cols, getSparkSession.read.format("csv").option("header", "true").option("nullValue", "null"),
-      testFile2)
-    df2.show()
-    val l2 = df2.select("ts").rdd.map(r => r(0)).collect.toList
-    l2.toString() should equal("List(null, null, 2022-02-01 09:00:00.0, null)" )
-  }
-
-  ignore("Test Load to Openmldb Offline Storage") {
+  // Plz DO NOT split this offline test into multi tests, cuz the test is contextual.
+  test("Test Load to Openmldb Offline Storage") {
     val originInfo = getLatestTableInfo(db, table)
-    assert(!originInfo.hasOfflineTableInfo, s"shouldn't have info $originInfo")
-    // P.S. src csv files have header, and the col names are different with table schema, and no s
-    // If soft-copy, we don't read data, can't do schema check. So we don't do restrict schema check now.
-    // TODO(hw): do restrict schema check even when soft-copy?
-    val testFile = "file://" + getClass.getResource("/load_data_test_src/test.csv").getPath
+    assert(!originInfo.hasOfflineTableInfo, s"shouldn't have offline info before the offline test, $originInfo")
+    // P.S.
+    // When the src **csv** files have header, and the col names are different with table schema,
+    // use the table schema to read, header in csv will be ignored.
+    val testFileWithHeader = "file://" + getClass.getResource("/load_data_test_src/test_with_any_header.csv").getPath
 
     println("no offline table info now, soft load data with any mode")
-    openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
+    openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
       "options(format='csv', deep_copy=false, null_value='123');")
     // getLatestTableInfo will refresh the table info cache
-    val softInfo = getLatestTableInfo(db, table)
+    var softInfo = getLatestTableInfo(db, table)
     assert(softInfo.hasOfflineTableInfo, s"no offline info $softInfo")
     // the offline info will be the same with load data options
-    assert(softInfo.getOfflineTableInfo.getPath == testFile)
+    assert(softInfo.getOfflineTableInfo.getPath == "")
+    assert(softInfo.getOfflineTableInfo.getSymbolicPathsList().asScala.toList(0) == testFileWithHeader)
     assert(softInfo.getOfflineTableInfo.getFormat == "csv")
     assert(softInfo.getOfflineTableInfo.getOptionsMap.get("nullValue") == "123")
-    assert(!softInfo.getOfflineTableInfo.getDeepCopy)
 
-    println("soft offline table now, simple deep load data with append mode")
-    try {
-      openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
-        "options(foo='bar', mode='append');")
+    println("soft offline table now, soft load data with error_if_exists mode")
+    a[IllegalArgumentException] should be thrownBy {
+      openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
+        "options(deep_copy=false, mode='error_if_exists');")
       fail("unreachable")
-    } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
     }
 
+    println("soft offline table now, soft load data with overwrite mode, will rewrite the info")
+    openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
+      "options(format='csv', deep_copy=false, null_value='456', mode='overwrite');")
+    // getLatestTableInfo will refresh the table info cache
+    softInfo = getLatestTableInfo(db, table)
+    assert(softInfo.hasOfflineTableInfo, s"no offline info $softInfo")
+    // the offline info will be the same with load data options
+    assert(softInfo.getOfflineTableInfo.getPath == "")
+    assert(softInfo.getOfflineTableInfo.getSymbolicPathsList().asScala.toList(0) == testFileWithHeader)
+    assert(softInfo.getOfflineTableInfo.getFormat == "csv")
+    assert(softInfo.getOfflineTableInfo.getOptionsMap.get("nullValue") == "456")
+
+    println("soft offline table now, simple deep load data with append mode")
+    a[IllegalArgumentException] should be thrownBy {
+      openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
+        "options(foo='bar', mode='append');")
+      fail("unreachable")
+    }
+
+
     println("soft offline table now, simple deep load data with overwrite mode")
-    var res = openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
+    var res = openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
       "options(format='csv', foo='bar', mode='overwrite');")
-    res.show()
+    assert(res.count() == 0)
     val info = getLatestTableInfo(db, table)
     assert(info.hasOfflineTableInfo, s"no offline info $info")
     assert(info.getOfflineTableInfo.getFormat == "parquet")
     assert(info.getOfflineTableInfo.getOptionsMap.isEmpty)
-    assert(info.getOfflineTableInfo.getDeepCopy)
 
-    println("deep load data again with strange delimiter")
-    // src csv files have header, if we read header with strange delimiter, the col name will contain invalid
-    // character(s) among " ,;{}()\n\t=". Set header to false, to avoid this error.
-    res = openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
-      "options(format='csv', foo='bar', delimiter='++', header=false, mode='append');")
-    res.show()
-    val info1 = getLatestTableInfo(db, table)
-    assert(info1.hasOfflineTableInfo, s"no offline info $info1")
-    // the offline info won't change
-    assert(info1.getOfflineTableInfo == info.getOfflineTableInfo)
 
-    println("deep load data when offline info is exist, and with 'errorifexists' mode")
+    // after load, we can read the offline table data
+    // only new openmldb session will register the latest offline tables
+    val newOpenmldbSession = new OpenmldbSession(getSparkSession)
+    val result = newOpenmldbSession.openmldbSql(s"select * from $db.$table")
+    assert(result.count() == 2)
+
+    // invalid load cases:
+    println("deep load data again with strange delimiter, null at non-null column c3, fail")
     try {
-      res = openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
-        "options(foo='bar', mode='error_if_exists');")
+      res = openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
+        "options(format='csv', delimiter='++', mode='overwrite');")
       fail("unreachable")
     } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
+      case e: SparkException => println("It should catch this: " + e.toString)
+      // should equal("The 2th field 'c3' of input row cannot be null.")
     }
 
-    println("deep load data with invalid format option")
-    try {
-      openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
+    println("deep load data when offline info is exist, and with 'error_if_exists' mode")
+    a[IllegalArgumentException] should be thrownBy {
+      res = openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
+        "options(foo='bar', mode='error_if_exists');")
+      fail("unreachable")
+    }
+
+    println("deep load data with invalid format option, catalog will throw exception")
+    a[org.apache.spark.sql.catalyst.parser.ParseException] should be thrownBy {
+      openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
         "options(format='txt', mode='overwrite');")
       fail("unreachable")
-    } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
     }
 
     println("deep offline table now, soft load data with any mode")
-    try {
-      openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
+    /* TODO: Support this case now and need to update case
+    a[IllegalArgumentException] should be thrownBy {
+      openmldbSession.openmldbSql(s"load data infile '$testFileWithHeader' into table $db.$table " +
         "options(deep_copy=false, mode='append');")
       fail("unreachable")
-    } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
     }
+    */
   }
 
   test("Test LoadData to Openmldb Online Storage") {
     openmldbSession.getOpenmldbBatchConfig.loadDataMode = "online"
-    val testFile = "file://" + getClass.getResource("/load_data_test_src/test.csv").getPath
+    val testFile = "file://" + getClass.getResource("/load_data_test_src/test_with_any_header.csv").getPath
     println("simple load to online storage")
     openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
       "options(mode='append');")
 
     println("online storage doesn't support soft copy")
-    try {
+    a[IllegalArgumentException] should be thrownBy {
       openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
         "options(mode='append', deep_copy=false);")
       fail("unreachable")
-    } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
     }
+
     println("online storage doesn't support overwrite mode")
-    try {
+    a[IllegalArgumentException] should be thrownBy {
       openmldbSession.openmldbSql(s"load data infile '$testFile' into table $db.$table " +
         "options(mode='overwrite', header=false);")
       fail("unreachable")
+    }
+    try {
+      val testNonNull = "file://" + getClass.getResource("/load_data_test_src/test_non_null.csv").getPath
+      openmldbSession.openmldbSql(s"load data infile '$testNonNull' into table $db.$table options(mode='append');")
+      fail("unreachable")
     } catch {
-      case e: IllegalArgumentException => println("It should catch this: " + e.toString)
+      case e: SparkException => println("It should catch this: " + e.toString)
+      // should equal("The 2th field 'c3' of input row cannot be null.")
     }
   }
 }

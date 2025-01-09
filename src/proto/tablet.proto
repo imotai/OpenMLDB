@@ -67,6 +67,7 @@ enum OPType {
     kDelReplicaRemoteOP = 18; 
     kAddReplicaRemoteOP = 19; 
     kAddIndexOP = 20; 
+    kDeployOP = 21;
 }
 
 enum TaskType {
@@ -91,12 +92,20 @@ enum TaskType {
     kCreateTableRemote = 19; 
     kDropTableRemote = 20; 
     kAddReplicaNSRemote = 21; 
-    kDumpIndexData = 22;
+    kDumpIndexData = 22 [deprecated = true];
     kSendIndexData = 23;
     kLoadIndexData = 24;
     kExtractIndexData = 25;
     kAddIndexToTablet = 26;
-    kTableSyncTask = 27;
+    kTableSyncTask = 27 [deprecated = true];
+    kSendIndexRequest = 28;
+    kExtractIndexRequest = 29;
+    kLoadIndexRequest = 30;
+    kAddIndexToTabletRequest = 31;
+    kAddIndexToTableInfo = 32;
+    kAddMultiTableIndex = 33;
+    kAddTableIndex = 34;
+    kCreateProcedure = 35;
 }
 
 enum TaskStatus {
@@ -120,7 +129,9 @@ message TaskInfo {
     optional string endpoint = 5;
     optional bool is_rpc_send = 6 [default = false];
     repeated uint64 rep_cluster_op_id = 7;      // for multi cluster
-    optional uint64 task_id = 8 [default = 0];  // for multi cluster
+    optional uint64 task_id = 8 [default = 0];
+    optional uint32 tid = 9;
+    optional uint32 pid = 10;
 }
 
 message OPInfo {
@@ -182,7 +193,10 @@ message PutRequest {
     optional uint32 pid = 5;
     repeated Dimension dimensions = 6;
     repeated TSDimension ts_dimensions = 7 [deprecated = true];
-    optional uint32 format_version = 8 [default = 0];
+    optional uint32 format_version = 8 [default = 0, deprecated = true];
+    optional uint32 memory_limit = 9;
+    optional bool put_if_absent = 10 [default = false];
+    optional bool check_exists = 11 [default = false];
 }
 
 message PutResponse {
@@ -195,6 +209,11 @@ message DeleteRequest {
     optional uint32 pid = 2;
     optional string key = 3;
     optional string idx_name = 4;
+    repeated Dimension dimensions = 5;
+    optional uint64 ts = 6;
+    optional uint64 end_ts = 7;
+    optional string ts_name = 8;
+    optional bool enable_decode_value = 9 [default = true];
 }
 
 message ExecuteGcRequest {
@@ -207,6 +226,7 @@ message GeneralRequest {
     required int32 pid = 2;
     optional TaskInfo task_info = 3;
     optional uint64 offset = 4;
+    optional openmldb.common.StorageMode storage_mode = 5 [default = kMemory];
 }
 
 message TaskStatusRequest {}
@@ -231,22 +251,20 @@ message GeneralResponse {
 message ScanRequest {
     // the prefix key
     optional string pk = 1;
-    // the start subfix key
+    // the start subfix key (inclusive)
     optional uint64 st = 2;
-    // the end subfix key
+    // the end subfix key (exclusive)
     optional uint64 et = 3;
     optional uint32 limit = 4;
     optional uint32 tid = 5;
     optional uint32 pid = 6;
     optional bool enable_remove_duplicated_record = 7 [default = false];
     optional string idx_name = 8;
-    optional GetType st_type = 9 [default = kSubKeyLe];
-    optional GetType et_type = 10 [default = kSubKeyGt];
-    optional bool enable_remove_ts = 11 [default = false];
-    optional uint32 atleast = 12 [default = 0];
-    repeated uint32 projection = 13;
-    repeated uint32 pid_group = 14;
-    optional bool use_attachment = 15 [default = false];
+    optional bool enable_remove_ts = 9 [default = false];
+    repeated uint32 projection = 10;
+    repeated uint32 pid_group = 11;
+    optional bool use_attachment = 12 [default = false];
+    optional uint32 skip_record_num = 13 [default = 0];
 }
 
 message TraverseRequest {
@@ -257,6 +275,8 @@ message TraverseRequest {
     optional string pk = 5;
     optional uint64 ts = 6;
     optional bool enable_remove_duplicated_record = 7 [default = false];
+    optional bool skip_current_pk = 8 [default = false];
+    optional uint32 ts_pos = 9;
 }
 
 message TraverseResponse {
@@ -268,6 +288,7 @@ message TraverseResponse {
     optional uint64 ts = 6;
     optional bool is_finish = 7;
     optional uint64 snapshot_id = 8;
+    optional uint32 ts_pos = 9;
 }
 
 message ScanResponse {
@@ -276,6 +297,7 @@ message ScanResponse {
     optional int32 code = 3;
     optional uint32 count = 4;
     optional uint32 buf_size = 5;
+    optional bool is_finish = 6 [default = true];
 }
 
 message ReplicaRequest {
@@ -306,10 +328,12 @@ message TableMeta {
     repeated openmldb.common.ColumnKey column_key = 11;
     repeated openmldb.common.ColumnDesc added_column_desc = 12;
     // format_version 0 , the legacy format 1 ,the new one
-    optional uint32 format_version = 13 [default = 0];
+    optional uint32 format_version = 13 [default = 0, deprecated = true];
     optional string db = 14 [default = ""];
     repeated common.VersionPair schema_versions = 15;
     repeated common.TablePartition table_partition = 16;
+    optional openmldb.common.StorageMode storage_mode = 17 [default = kMemory];
+    optional uint32 base_table_tid = 18 [default = 0];
 }
 
 message CreateTableRequest {
@@ -339,6 +363,16 @@ message DropTableRequest {
 }
 
 message DropTableResponse {
+    optional int32 code = 1;
+    optional string msg = 2;
+}
+
+message TruncateTableRequest {
+    optional int32 tid = 1;
+    optional int32 pid = 2;
+}
+
+message TruncateTableResponse {
     optional int32 code = 1;
     optional string msg = 2;
 }
@@ -382,6 +416,8 @@ message LogEntry {
     repeated Dimension dimensions = 6;
     optional MethodType method_type = 7;
     repeated TSDimension ts_dimensions = 8 [deprecated = true];
+    optional uint64 end_ts = 9;  // only for range delete: [ts, end_ts)
+    optional string ts_name = 10;
 }
 
 message AppendEntriesRequest {
@@ -436,6 +472,7 @@ message SendDataRequest {
     optional uint32 block_size = 5;
     optional bool eof = 6 [default = false];
     optional string dir_name = 7;
+    optional openmldb.common.StorageMode storage_mode = 8 [default = kMemory];
 }
 
 message ChangeRoleResponse {
@@ -474,6 +511,9 @@ message TableStatus {
     optional openmldb.type.CompressType compress_type = 17;
     optional uint32 skiplist_height = 18;
     optional uint64 diskused = 19 [default = 0];
+    optional openmldb.common.StorageMode storage_mode = 20 [default = kMemory];
+    optional string snapshot_path = 21;
+    optional string binlog_path = 22;
 }
 
 message GetTableStatusResponse {
@@ -525,6 +565,7 @@ message CountResponse {
 message GetTermPairRequest {
     optional uint32 tid = 1;
     optional uint32 pid = 2;
+    optional openmldb.common.StorageMode storage_mode = 3 [default = kMemory];
 }
 
 message GetTermPairResponse {
@@ -539,6 +580,7 @@ message GetTermPairResponse {
 message GetManifestRequest {
     optional uint32 tid = 1;
     optional uint32 pid = 2;
+    optional openmldb.common.StorageMode storage_mode = 3 [default = kMemory];
 }
 
 message GetManifestResponse { 
@@ -570,6 +612,7 @@ message CheckFileRequest {
     optional string file = 3;
     optional uint64 size = 4;
     optional string dir_name = 5;
+    optional openmldb.common.StorageMode storage_mode = 6 [default = kMemory];
 }
 
 message AddIndexRequest {
@@ -597,15 +640,6 @@ message DeleteIndexRequest {
     optional string idx_name = 3;
 }
 
-message DumpIndexDataRequest {
-    optional uint32 tid = 1;
-    optional uint32 pid = 2;
-    optional uint32 partition_num = 3;
-    optional uint32 idx = 4;
-    optional openmldb.common.ColumnKey column_key = 5;
-    optional TaskInfo task_info = 6;
-}
-
 message LoadIndexDataRequest {
     optional uint32 tid = 1;
     optional uint32 pid = 2;
@@ -613,20 +647,14 @@ message LoadIndexDataRequest {
     optional TaskInfo task_info = 4;
 }
 
-message ExtractMultiIndexDataRequest {
-    optional uint32 tid = 1;
-    optional uint32 pid = 2;
-    optional uint32 partition_num = 3;
-    repeated openmldb.common.ColumnKey column_key = 4;
-}
-
 message ExtractIndexDataRequest {
     optional uint32 tid = 1;
     optional uint32 pid = 2;
     optional uint32 partition_num = 3;
-    optional uint32 idx = 4;
-    optional openmldb.common.ColumnKey column_key = 5;
-    optional TaskInfo task_info = 6;
+    repeated openmldb.common.ColumnKey column_key = 5;
+    optional uint64 offset = 6;
+    optional bool dump_data = 7 [default = true];
+    optional TaskInfo task_info = 8;
 }
 
 message Columns {
@@ -815,11 +843,61 @@ message BulkLoadInfoResponse {
                 required uint32 key = 1; // TODO(hw): java will use int, cpp uses uint32. Not good?
                 required uint32 value = 2;
             }
-            repeated MapFieldEntry ts_idx_map = 2; // TODO(hw): proto3 supports map
+            repeated MapFieldEntry ts_idx_map = 2; // TODO(hw): proto3 can build map in proto2 syntax
         }
         repeated Segment segment = 1;
     }
     repeated InnerSegments inner_segments = 6; // MemTable::segments_
+}
+
+message CreateFunctionRequest {
+    optional openmldb.common.ExternalFun fun = 1;
+}
+
+message CreateFunctionResponse {
+    optional int32 code = 1;
+    optional string msg = 2;
+}
+
+message DropFunctionRequest {
+    optional openmldb.common.ExternalFun fun = 1;
+}
+
+message DropFunctionResponse {
+    optional int32 code = 1;
+    optional string msg = 2;
+}
+
+message CreateAggregatorRequest {
+    optional TableMeta base_table_meta = 1;
+    optional uint32 aggr_table_tid = 2;
+    optional uint32 aggr_table_pid = 3;
+    optional uint32 index_pos = 4;
+    optional string aggr_func = 5;
+    optional string aggr_col = 6;
+    optional string order_by_col = 7;
+    optional string bucket_size = 8;
+    optional string filter_col = 9;
+}
+
+message CreateAggregatorResponse {
+    optional int32 code = 1;
+    optional string msg = 2;
+}
+
+message GAFDeployStatsRequest {}
+
+message DeployStatsResponse {
+    optional int32 code = 1;
+    optional string msg = 2;
+    message DeployStat {
+        required string deploy_name = 1;
+        // NOTE: time and total is the microsecond string
+        required string time = 2;
+        required uint32 count = 3;
+        required string total = 4;
+    }
+    repeated DeployStat rows = 3;
 }
 
 service TabletServer {
@@ -841,6 +919,7 @@ service TabletServer {
     rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
     rpc LoadTable(LoadTableRequest) returns (GeneralResponse);
     rpc DropTable(DropTableRequest) returns (DropTableResponse);
+    rpc TruncateTable(TruncateTableRequest) returns (TruncateTableResponse);
     rpc GetTableStatus(GetTableStatusRequest) returns (GetTableStatusResponse);
     rpc GetTableSchema(GetTableSchemaRequest) returns (GetTableSchemaResponse);
     rpc GetTableFollower(GetTableFollowerRequest) returns (GetTableFollowerResponse);
@@ -878,10 +957,8 @@ service TabletServer {
     rpc AddIndex(AddIndexRequest) returns (GeneralResponse);
     rpc SendIndexData(SendIndexDataRequest) returns (GeneralResponse);
     rpc DeleteIndex(DeleteIndexRequest) returns (GeneralResponse);
-    rpc DumpIndexData(DumpIndexDataRequest) returns (GeneralResponse);
     rpc LoadIndexData(LoadIndexDataRequest) returns (GeneralResponse);
     rpc ExtractIndexData(ExtractIndexDataRequest) returns (GeneralResponse);
-    rpc ExtractMultiIndexData(ExtractMultiIndexDataRequest) returns (GeneralResponse);
     rpc CancelOP(CancelOPRequest) returns (GeneralResponse);
     rpc UpdateRealEndpointMap(UpdateRealEndpointMapRequest) returns (GeneralResponse);
 
@@ -893,4 +970,15 @@ service TabletServer {
     // TODO(hw): nameserver call this?
     rpc GetBulkLoadInfo(BulkLoadInfoRequest) returns (BulkLoadInfoResponse);
     rpc BulkLoad(BulkLoadRequest) returns (GeneralResponse);
+    rpc CreateFunction(CreateFunctionRequest) returns (CreateFunctionResponse);
+    rpc DropFunction(DropFunctionRequest) returns (DropFunctionResponse);
+
+
+    // pre aggregator interfaces
+    rpc CreateAggregator(CreateAggregatorRequest) returns (CreateAggregatorResponse);
+    // monitoring interfaces
+    rpc GetAndFlushDeployStats(GAFDeployStatsRequest) returns (DeployStatsResponse);
+
+    // flush privilege
+    rpc FlushPrivileges(EmptyRequest) returns (GeneralResponse);
 }

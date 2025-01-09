@@ -1,3 +1,8 @@
+# The coverage jobs for cpp code
+#
+# This sperate job exists because C/CPP coverage require build type to be Debug.
+# Other coverage jobs e.g java/scala's coverage lives alongside with their test jobs.
+
 name: coverage
 
 on:
@@ -5,74 +10,104 @@ on:
     branches:
       - main
     paths-ignore:
-      - docs/
-      - demo/
-      - release/
-      - image/
-      - tools/
+      - 'docs/**'
+      - 'demo/**'
+      - 'docker/**'
+      - 'image/**'
+      - 'release/**'
+      - 'tools/**'
+      - '*.md'
+      - 'benchmark/**'
   pull_request:
     paths-ignore:
-      - docs/
-      - demo/
-      - release/
-      - image/
-      - tools/
+      - 'docs/**'
+      - 'demo/**'
+      - 'docker/**'
+      - 'image/**'
+      - 'release/**'
+      - 'tools/**'
+      - '*.md'
+      - 'benchmark/**'
   workflow_dispatch:
 
 jobs:
   coverage:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     container:
-      image: ghcr.io/4paradigm/hybridsql:0.4.1
+      image: ghcr.io/4paradigm/hybridsql:latest
     env:
       CTEST_PARALLEL_LEVEL: 1 # parallel test level for ctest (make test)
       CMAKE_BUILD_TYPE: Debug
-      SQL_PYSDK_ENABLE: OFF
-      SQL_JAVASDK_ENABLE: ON
       TESTING_ENABLE: ON
-      NPROC: 8
-      SPARK_HOME: /tmp/spark/
+      SQL_PYSDK_ENABLE: OFF
+      SQL_JAVASDK_ENABLE: OFF
+      NPROC: 2
+      BUILD_SHARED_LIBS: ON
+      TESTING_ENABLE_STRIP: ON
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Cache local Maven repository
-        uses: actions/cache@v2
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('java/**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
+#       - name: download lcov
+#         uses: actions/checkout@v4
+#         with:
+#           repository: linux-test-project/lcov
+#           ref: v1.16
+#           path: lcov
+# 
+#       - name: install lcov
+#         working-directory: lcov
+#         run: |
+#           sudo make install
 
       - name: coverage configure
         run: |
           make coverage-configure
 
-      - name: build openmldb
-        run: |
-          cmake --build build --target openmldb -- -j${{ env.NPROC }}
-
       - name: start service
         run: |
-          sh steps/ut_zookeeper.sh start
-          sh steps/download_openmldb_spark.sh $SPARK_HOME
-          cd onebox
-          bash start_onebox.sh
-
-      - name: Build and Coverage
+          ./steps/ut_zookeeper.sh start
+      # make coverage-cpp will gen 16G build/ (no run), run test will take 2G more, so split make and test
+      - name: Coverage CPP
         run: |
-          make coverage
+          make coverage-cpp
+
+      - name: debug
+        if: always()
+        run: |
+          du -d 1 -h build
+          df -h
+
+      - name: upload coverage
+        uses: actions/upload-artifact@v3
+        with:
+          # include the generated html report in build/coverage, great for local diagnose
+          name: coverage-cpp-${{ github.sha }}
+          path: |
+            build/coverage.*
+            build/coverage/
+          retention-days: 3
+
+  coverage-publish:
+    needs: ["coverage"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: coverage-cpp-${{ github.sha }}
+          path: build
 
       - name: Upload Coverage Report
-        uses: codecov/codecov-action@v2
+        uses: codecov/codecov-action@v4
         with:
-          files: build/coverage.info,java/**/target/site/jacoco/jacoco.xml,java/**/target/scoverage.xml
-          name: coverage
+          files: build/coverage.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          name: coverage-cpp
           fail_ci_if_error: true
           verbose: true
-
-      - name: stop service
-        run: |
-          ./onebox/stop_all.sh
-          sh steps/ut_zookeeper.sh stop

@@ -18,70 +18,46 @@ package com._4paradigm.openmldb.sdk.impl;
 
 import com._4paradigm.openmldb.*;
 
+import com._4paradigm.openmldb.common.codec.CodecUtil;
+import com._4paradigm.openmldb.common.codec.FlexibleRowBuilder;
+import com._4paradigm.openmldb.jdbc.PreparedStatement;
 import com._4paradigm.openmldb.jdbc.SQLInsertMetaData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.InputStream;
-import java.io.Reader;
-import java.math.BigDecimal;
-import java.net.URL;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.sql.*;
 import java.sql.Date;
 import java.sql.ResultSet;
 import java.util.*;
 
-public class InsertPreparedStatementImpl implements PreparedStatement {
-    public static final Charset CHARSET = StandardCharsets.UTF_8;
-    private String currentSql = null;
-    private SQLInsertRow currentRow = null;
-    private SQLInsertRows currentRows = null;
-    private SQLRouter router = null;
-    private List<Object> currentDatas = null;
-    private List<DataType> currentDatasType = null;
-    private Schema currentSchema = null;
-    private String db = null;
-    private List<Boolean> hasSet = null;
+public class InsertPreparedStatementImpl extends PreparedStatement {
     private static final Logger logger = LoggerFactory.getLogger(InsertPreparedStatementImpl.class);
-    private boolean closed = false;
-    private boolean closeOnComplete = false;
-    private Map<String, SQLInsertRows> sqlRowsMap = new HashMap<>();
-    private List<Integer> scehmaIdxs = null;
-    private Map<Integer, Integer> stringsLen = new HashMap<>();
 
-    public InsertPreparedStatementImpl(String db, String sql, SQLRouter router) throws SQLException {
-        Status status = new Status();
-        SQLInsertRows rows = router.GetInsertRows(db, sql, status);
-        if (status.getCode() != 0) {
-            String msg = status.getMsg();
-            status.delete();
-            if (rows != null) {
-                rows.delete();
-            }
-            logger.error("getInsertRows fail: {}", msg);
-            throw new SQLException("get insert rows fail " + msg + " in construction preparedstatement");
-        }
-        this.currentRows = rows;
-        this.currentRow = rows.NewRow();
+    private SQLRouter router;
+    private FlexibleRowBuilder rowBuilder;
+    private InsertPreparedStatementMeta cache;
+
+    private Set<Integer> indexCol;
+    private Map<Integer, List<Integer>> indexMap;
+    private Map<Integer, String> indexValue;
+    private Map<Integer, String> defaultIndexValue;
+    private List<AbstractMap.SimpleImmutableEntry<ByteBuffer, ByteBuffer>> batchValues;
+
+    public InsertPreparedStatementImpl(InsertPreparedStatementMeta cache, SQLRouter router) throws SQLException {
         this.router = router;
-        this.currentSql = sql;
-        currentSchema = this.currentRow.GetSchema();
-        this.db = db;
-        VectorUint32 idxs = this.currentRow.GetHoleIdx();
-        currentDatas = new ArrayList<>(idxs.size());
-        currentDatasType = new ArrayList<>(idxs.size());
-        hasSet = new ArrayList<>(idxs.size());
-        scehmaIdxs = new ArrayList<>(idxs.size());
-        for (int i = 0; i < idxs.size(); i++) {
-            long idx = idxs.get(i);
-            DataType type = currentSchema.GetColumnType(idx);
-            currentDatasType.add(type);
-            currentDatas.add(null);
-            hasSet.add(false);
-            scehmaIdxs.add(i);
-        }
+        rowBuilder = new FlexibleRowBuilder(cache.getCodecMeta());
+        this.cache = cache;
+        indexCol = cache.getIndexPos();
+        indexMap = cache.getIndexMap();
+        indexValue = new HashMap<>();
+        defaultIndexValue = cache.getDefaultIndexValue();
+        batchValues = new ArrayList<>();
+    }
+
+    private int getSchemaIdx(int idx) throws SQLException {
+        return cache.getSchemaIdx(idx - 1);
     }
 
     @Override
@@ -96,277 +72,264 @@ public class InsertPreparedStatementImpl implements PreparedStatement {
         throw new SQLException("current do not support this method");
     }
 
-    private void checkIdx(int i) throws SQLException {
-        if (closed) {
-            throw new SQLException("preparedstatement closed");
-        }
-        if (i <= 0) {
-            throw new SQLException("error sqe number");
-        }
-        if (i > scehmaIdxs.size()) {
-            throw new SQLException("out of data range");
-        }
-    }
-
-    private void checkType(int i, DataType type) throws SQLException {
-        if (currentDatasType.get(i - 1) != type) {
-            throw new SQLException("data type not match");
-        }
-    }
-
-    private void setNull(int i) throws SQLException {
-        checkIdx(i);
-        boolean notAllowNull = checkNotAllowNull(i);
-        if (notAllowNull) {
+    private boolean setNull(int i) throws SQLException {
+        if (!cache.getSchema().isNullable(i)) {
             throw new SQLException("this column not allow null");
         }
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, null);
+        return rowBuilder.setNULL(i);
     }
 
     @Override
     public void setNull(int i, int i1) throws SQLException {
-        setNull(i);
+        int realIdx = getSchemaIdx(i);
+        if (!setNull(realIdx)) {
+            throw new SQLException("set null failed. pos is " + i);
+        }
+        if (indexCol.contains(realIdx)) {
+            indexValue.put(realIdx, InsertPreparedStatementMeta.NONETOKEN);
+        }
     }
 
     @Override
     public void setBoolean(int i, boolean b) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeBool);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, b);
-    }
-
-    @Override
-    @Deprecated
-    public void setByte(int i, byte b) throws SQLException {
-        throw new SQLException("current do not support this method");
+        int realIdx = getSchemaIdx(i);
+        if (!rowBuilder.setBool(realIdx, b)) {
+            throw new SQLException("set bool failed. pos is " + i);
+        }
+        if (indexCol.contains(realIdx)) {
+            indexValue.put(realIdx, String.valueOf(b));
+        }
     }
 
     @Override
     public void setShort(int i, short i1) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeInt16);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, i1);
+        int realIdx = getSchemaIdx(i);
+        if (!rowBuilder.setSmallInt(realIdx, i1)) {
+            throw new SQLException("set short failed. pos is " + i);
+        }
+        if (indexCol.contains(realIdx)) {
+            indexValue.put(realIdx, String.valueOf(i1));
+        }
     }
 
     @Override
     public void setInt(int i, int i1) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeInt32);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, i1);
-
+        int realIdx = getSchemaIdx(i);
+        if (!rowBuilder.setInt(realIdx, i1)) {
+            throw new SQLException("set int failed. pos is " + i);
+        }
+        if (indexCol.contains(realIdx)) {
+            indexValue.put(realIdx, String.valueOf(i1));
+        }
     }
 
     @Override
     public void setLong(int i, long l) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeInt64);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, l);
+        int realIdx = getSchemaIdx(i);
+        if (!rowBuilder.setBigInt(realIdx, l)) {
+            throw new SQLException("set long failed. pos is " + i);
+        }
+        if (indexCol.contains(realIdx)) {
+            indexValue.put(realIdx, String.valueOf(l));
+        }
     }
 
     @Override
     public void setFloat(int i, float v) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeFloat);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, v);
+        if (!rowBuilder.setFloat(getSchemaIdx(i), v)) {
+            throw new SQLException("set float failed. pos is " + i);
+        }
     }
 
     @Override
     public void setDouble(int i, double v) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeDouble);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, v);
-    }
-
-    @Override
-    @Deprecated
-    public void setBigDecimal(int i, BigDecimal bigDecimal) throws SQLException {
-        throw new SQLException("current do not support this type");
-    }
-
-    private boolean checkNotAllowNull(int i) {
-        long idx = this.scehmaIdxs.get(i - 1);
-        return this.currentSchema.IsColumnNotNull(idx);
+        if (!rowBuilder.setDouble(getSchemaIdx(i), v)) {
+            throw new SQLException("set double failed. pos is " + i);
+        }
     }
 
     @Override
     public void setString(int i, String s) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeString);
+        int realIdx = getSchemaIdx(i);
         if (s == null) {
-            setNull(i);
+            setNull(realIdx);
+            if (indexCol.contains(realIdx)) {
+                indexValue.put(realIdx, InsertPreparedStatementMeta.NONETOKEN);
+            }
             return;
         }
-        byte[] bytes = s.getBytes(CHARSET);
-        stringsLen.put(i, bytes.length);
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, bytes);
-    }
-
-    @Override
-    @Deprecated
-    public void setBytes(int i, byte[] bytes) throws SQLException {
-        throw new SQLException("current do not support this type");
+        if (!rowBuilder.setString(getSchemaIdx(i), s)) {
+            throw new SQLException("set string failed. pos is " + i);
+        }
+        if (indexCol.contains(realIdx)) {
+            if (s.isEmpty()) {
+                indexValue.put(realIdx, InsertPreparedStatementMeta.EMPTY_STRING);
+            } else {
+                indexValue.put(realIdx, s);
+            }
+        }
     }
 
     @Override
     public void setDate(int i, Date date) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeDate);
+        int realIdx = getSchemaIdx(i);
+        if (indexCol.contains(realIdx)) {
+            if (date != null) {
+                indexValue.put(realIdx, String.valueOf(CodecUtil.dateToDateInt(date)));
+            } else {
+                indexValue.put(realIdx, InsertPreparedStatementMeta.NONETOKEN);
+            }
+        }
         if (date == null) {
-            setNull(i);
+            if (!setNull(realIdx)) {
+                throw new SQLException("set date failed. pos is " + i);
+            }
             return;
         }
-        hasSet.set(i - 1, true);
-        currentDatas.set(i - 1, date);
-
+        if (!rowBuilder.setDate(realIdx, date)) {
+            throw new SQLException("set date failed. pos is " + i);
+        }
     }
 
-    @Override
-    @Deprecated
-    public void setTime(int i, Time time) throws SQLException {
-        throw new SQLException("current do not support this type");
-    }
 
     @Override
     public void setTimestamp(int i, Timestamp timestamp) throws SQLException {
-        checkIdx(i);
-        checkType(i, DataType.kTypeTimestamp);
+        int realIdx = getSchemaIdx(i);
+        if (indexCol.contains(realIdx)) {
+            if (timestamp != null) {
+                indexValue.put(realIdx, String.valueOf(timestamp.getTime()));
+            } else {
+                indexValue.put(realIdx, InsertPreparedStatementMeta.NONETOKEN);
+            }
+        }
         if (timestamp == null) {
-            setNull(i);
+            if (!setNull(realIdx)) {
+                throw new SQLException("set timestamp failed. pos is " + i);
+            }
             return;
         }
-        hasSet.set(i - 1, true);
-        long ts = timestamp.getTime();
-        currentDatas.set(i - 1, ts);
-    }
-
-    @Override
-    @Deprecated
-    public void setAsciiStream(int i, InputStream inputStream, int i1) throws SQLException {
-        throw new SQLException("current do not support this type");
-    }
-
-    @Override
-    @Deprecated
-    public void setUnicodeStream(int i, InputStream inputStream, int i1) throws SQLException {
-        throw new SQLException("current do not support this type");
-    }
-
-    @Override
-    @Deprecated
-    public void setBinaryStream(int i, InputStream inputStream, int i1) throws SQLException {
-        throw new SQLException("current do not support this type");
+        if (!rowBuilder.setTimestamp(realIdx, timestamp)) {
+            throw new SQLException("set timestamp failed. pos is " + i);
+        }
     }
 
     @Override
     public void clearParameters() throws SQLException {
-        for (int i = 0; i < hasSet.size(); i++) {
-            hasSet.set(i, false);
-            currentDatas.set(i, null);
-        }
-        stringsLen.clear();
+        rowBuilder.clear();
+        indexValue.clear();
     }
 
-    @Override
-    @Deprecated
-    public void setObject(int i, Object o, int i1) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    private void dataBuild() throws SQLException {
-        if (currentRows == null) {
-            throw new SQLException("null rows");
-        }
-        if (currentRow == null) {
-            currentRow = currentRows.NewRow();
-        }
-        if (currentRow == null) {
-            long rowCount = currentRows.GetCnt();
-            logger.error("current rows count {}, rows.back().IsComplete = {}", rowCount, rowCount > 0 ?
-                    currentRows.GetRow(rowCount - 1).IsComplete() : "N/A");
-            throw new SQLException("create jni row failed");
-        }
-
-        int strLen = 0;
-        for (Map.Entry<Integer, Integer> entry : stringsLen.entrySet()) {
-            strLen += entry.getValue();
-        }
-
-        boolean ok = currentRow.Init(strLen);
-        if (!ok) {
-            throw new SQLException("build data row failed");
-        }
-
-        for (int i = 0; i < currentDatasType.size(); i++) {
-            Object data = currentDatas.get(i);
-            if (data == null) {
-                ok = currentRow.AppendNULL();
-            } else {
-                DataType curType = currentDatasType.get(i);
-                if (DataType.kTypeBool.equals(curType)) {
-                    ok = currentRow.AppendBool((boolean) data);
-                } else if (DataType.kTypeDate.equals(curType)) {
-                    java.sql.Date date = (java.sql.Date) data;
-                    ok = currentRow.AppendDate(date.getYear() + 1900, date.getMonth() + 1, date.getDate());
-                } else if (DataType.kTypeDouble.equals(curType)) {
-                    ok = currentRow.AppendDouble((double) data);
-                } else if (DataType.kTypeFloat.equals(curType)) {
-                    ok = currentRow.AppendFloat((float) data);
-                } else if (DataType.kTypeInt16.equals(curType)) {
-                    ok = currentRow.AppendInt16((short) data);
-                } else if (DataType.kTypeInt32.equals(curType)) {
-                    ok = currentRow.AppendInt32((int) data);
-                } else if (DataType.kTypeInt64.equals(curType)) {
-                    ok = currentRow.AppendInt64((long) data);
-                } else if (DataType.kTypeString.equals(curType)) {
-                    byte[] bdata = (byte[]) data;
-                    ok = currentRow.AppendString(bdata, bdata.length);
-                } else if (DataType.kTypeTimestamp.equals(curType)) {
-                    ok = currentRow.AppendTimestamp((long) data);
+    private ByteBuffer buildDimension() throws SQLException {
+        int totalLen = 0;
+        Map<Integer, Integer> lenMap = new HashMap<>();
+        for (Map.Entry<Integer, List<Integer>> entry : indexMap.entrySet()) {
+            totalLen += 4; // encode the size of idx(int)
+            totalLen += 4; // encode the value size
+            int curLen = entry.getValue().size() - 1;
+            for (Integer pos : entry.getValue()) {
+                if (indexValue.containsKey(pos)) {
+                    curLen += indexValue.get(pos).getBytes(CodecUtil.CHARSET).length;
+                } else if (defaultIndexValue.containsKey(pos)) {
+                    curLen += defaultIndexValue.get(pos).getBytes(CodecUtil.CHARSET).length;
                 } else {
-                    throw new SQLException("unkown data type");
+                    throw new SQLException("cannot get index value. pos is " + pos);
+                }
+            }
+            totalLen += curLen;
+            lenMap.put(entry.getKey(), curLen);
+        }
+        ByteBuffer dimensionValue = ByteBuffer.allocate(totalLen).order(ByteOrder.LITTLE_ENDIAN);
+        for (Map.Entry<Integer, List<Integer>> entry : indexMap.entrySet()) {
+            Integer indexPos = entry.getKey();
+            dimensionValue.putInt(indexPos);
+            dimensionValue.putInt(lenMap.get(indexPos));
+            for (int i = 0; i < entry.getValue().size(); i++) {
+                int pos = entry.getValue().get(i);
+                if (i > 0) {
+                    dimensionValue.put((byte)'|');
+                }
+                if (indexValue.containsKey(pos)) {
+                    dimensionValue.put(indexValue.get(pos).getBytes(CodecUtil.CHARSET));
+                } else {
+                    dimensionValue.put(defaultIndexValue.get(pos).getBytes(CodecUtil.CHARSET));
                 }
             }
         }
-        if (!currentRow.Build()) {
-            throw new SQLException("build insert row failed");
-        }
-        currentRow = null;
-        clearParameters();
+        return dimensionValue;
     }
 
-    @Override
-    @Deprecated
-    public void setObject(int i, Object o) throws SQLException {
-        throw new SQLException("current do not support this method");
+    private ByteBuffer buildRow() throws SQLException {
+        Map<Integer, Object> defaultValue = cache.getDefaultValue();
+        if (!defaultValue.isEmpty()) {
+            for (Map.Entry<Integer, Object> entry : defaultValue.entrySet()) {
+                int idx = entry.getKey();
+                Object val = entry.getValue();
+                if (val == null) {
+                    rowBuilder.setNULL(idx);
+                    continue;
+                }
+                switch (cache.getSchema().getColumnType(idx)) {
+                    case Types.BOOLEAN:
+                        rowBuilder.setBool(idx, (boolean)val);
+                        break;
+                    case Types.SMALLINT:
+                        rowBuilder.setSmallInt(idx, (short)val);
+                        break;
+                    case Types.INTEGER:
+                        rowBuilder.setInt(idx, (int)val);
+                        break;
+                    case Types.BIGINT:
+                        rowBuilder.setBigInt(idx, (long)val);
+                        break;
+                    case Types.FLOAT:
+                        rowBuilder.setFloat(idx, (float)val);
+                        break;
+                    case Types.DOUBLE:
+                        rowBuilder.setDouble(idx, (double)val);
+                        break;
+                    case Types.DATE:
+                        rowBuilder.setDate(idx, (Date)val);
+                        break;
+                    case Types.TIMESTAMP:
+                        rowBuilder.setTimestamp(idx, (Timestamp)val);
+                        break;
+                    case Types.VARCHAR:
+                        rowBuilder.setString(idx, (String)val);
+                        break;
+                }
+            }
+        }
+        if (!rowBuilder.build()) {
+            throw new SQLException("encode row failed");
+        }
+        return rowBuilder.getValue();
     }
 
     @Override
     public boolean execute() throws SQLException {
         if (closed) {
-            throw new SQLException("preparedstatement closed");
+            throw new SQLException("InsertPreparedStatement closed");
         }
-        if (!sqlRowsMap.isEmpty() || this.currentRows.GetCnt() > 1) {
+        if (!batchValues.isEmpty()) {
             throw new SQLException("please use executeBatch");
         }
-        dataBuild();
+        ByteBuffer dimensions = buildDimension();
+        ByteBuffer value = buildRow();
         Status status = new Status();
-        boolean ok = router.ExecuteInsert(db, currentSql, currentRows, status);
+        // actually only one row
+        boolean ok = router.ExecuteInsert(cache.getDatabase(), cache.getName(),
+                cache.getTid(), cache.getPartitionNum(),
+                dimensions.array(), dimensions.capacity(), value.array(), value.capacity(), cache.isPutIfAbsent(), status);
+        // cleanup rows even if insert failed
+        // we can't execute() again without set new row, so we must clean up here
+        clearParameters();
         if (!ok) {
-            logger.error("getInsertRow fail: {}", status.getMsg());
+            logger.error("execute insert failed: {}", status.ToString());
             status.delete();
-            status = null;
             return false;
         }
+
         status.delete();
-        status = null;
         if (closeOnComplete) {
             close();
         }
@@ -376,208 +339,26 @@ public class InsertPreparedStatementImpl implements PreparedStatement {
     @Override
     public void addBatch() throws SQLException {
         if (closed) {
-            throw new SQLException("preparedstatement closed");
+            throw new SQLException("InsertPreparedStatement closed");
         }
-        dataBuild();
+        batchValues.add(new AbstractMap.SimpleImmutableEntry<>(buildDimension(), buildRow()));
+        clearParameters();
     }
 
-    @Override
-    @Deprecated
-    public void setCharacterStream(int i, Reader reader, int i1) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
 
     @Override
-    @Deprecated
-    public void setRef(int i, Ref ref) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setBlob(int i, Blob blob) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setClob(int i, Clob clob) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setArray(int i, Array array) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
     public ResultSetMetaData getMetaData() throws SQLException {
-        return new SQLInsertMetaData(this.currentDatasType, this.currentSchema, this.scehmaIdxs);
+        return new SQLInsertMetaData(cache.getSchema(), cache.getHoleIdx());
     }
 
     @Override
-    @Deprecated
     public void setDate(int i, Date date, Calendar calendar) throws SQLException {
-        throw new SQLException("current do not support this method");
+        setDate(i, date);
     }
 
     @Override
-    @Deprecated
-    public void setTime(int i, Time time, Calendar calendar) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
     public void setTimestamp(int i, Timestamp timestamp, Calendar calendar) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNull(int i, int i1, String s) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setURL(int i, URL url) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public ParameterMetaData getParameterMetaData() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setRowId(int i, RowId rowId) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNString(int i, String s) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNCharacterStream(int i, Reader reader, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNClob(int i, NClob nClob) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setClob(int i, Reader reader, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setBlob(int i, InputStream inputStream, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNClob(int i, Reader reader, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setSQLXML(int i, SQLXML sqlxml) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setObject(int i, Object o, int i1, int i2) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setAsciiStream(int i, InputStream inputStream, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setBinaryStream(int i, InputStream inputStream, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setCharacterStream(int i, Reader reader, long l) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setAsciiStream(int i, InputStream inputStream) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setBinaryStream(int i, InputStream inputStream) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setCharacterStream(int i, Reader reader) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNCharacterStream(int i, Reader reader) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setClob(int i, Reader reader) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setBlob(int i, InputStream inputStream) throws SQLException {
-
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setNClob(int i, Reader reader) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public ResultSet executeQuery(String s) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int executeUpdate(String s) throws SQLException {
-        throw new SQLException("current do not support this method");
+        setTimestamp(i, timestamp);
     }
 
     @Override
@@ -585,314 +366,31 @@ public class InsertPreparedStatementImpl implements PreparedStatement {
         if (closed) {
             return;
         }
-        for (String key : sqlRowsMap.keySet()) {
-            SQLInsertRows rows = sqlRowsMap.get(key);
-            rows.delete();
-            rows = null;
-        }
-        sqlRowsMap.clear();
-        if (currentRow != null) {
-            currentRow.delete();
-            currentRow = null;
-        }
-        if (currentRows != null) {
-            currentRows.delete();
-            currentRows = null;
-        }
-        if (currentSchema != null) {
-            currentSchema.delete();
-            currentSchema = null;
-        }
         closed = true;
-    }
-
-    @Override
-    @Deprecated
-    public int getMaxFieldSize() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setMaxFieldSize(int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getMaxRows() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setMaxRows(int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setEscapeProcessing(boolean b) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getQueryTimeout() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setQueryTimeout(int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void cancel() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public SQLWarning getWarnings() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void clearWarnings() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setCursorName(String s) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean execute(String s) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public ResultSet getResultSet() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getUpdateCount() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean getMoreResults() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setFetchDirection(int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Deprecated
-    @Override
-    public int getFetchDirection() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public void setFetchSize(int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getFetchSize() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getResultSetConcurrency() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getResultSetType() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    public void addBatch(String s) throws SQLException {
-        if (currentDatas.size() > 0 && s.equals(this.currentSql)) {
-            throw new SQLException("data not enough");
-        }
-        if (sqlRowsMap.get(s) != null) {
-            return;
-        }
-        Status status = new Status();
-        SQLInsertRows rows = router.GetInsertRows(db, s, status);
-        if (status.getCode() != 0) {
-            String msg = status.getMsg();
-            status.delete();
-            if (rows != null) {
-                rows.delete();
-            }
-            logger.error("getInsertRows fail: {}", msg);
-            throw new SQLException("get insertrows fail " + msg + " in construction preparedstatement");
-        }
-        status.delete();
-        status = null;
-        SQLInsertRow row = rows.NewRow();
-        if (row.GetHoleIdx().size() > 0) {
-            row.delete();
-            rows.delete();
-            throw new SQLException("this sql need data");
-        }
-        row.delete();
-        sqlRowsMap.put(s, rows);
-    }
-
-    @Override
-    @Deprecated
-    public void clearBatch() throws SQLException {
-        throw new SQLException("current do not support this method");
     }
 
     @Override
     public int[] executeBatch() throws SQLException {
         if (closed) {
-            throw new SQLException("preparedstatement closed");
+            throw new SQLException("InsertPreparedStatement closed");
         }
-        int result[] = new int[1 + sqlRowsMap.size()];
+        int[] result = new int[batchValues.size()];
         Status status = new Status();
-        boolean ok = router.ExecuteInsert(db, currentSql, currentRows, status);
-        if (!ok) {
-            result[0] = -1;
-        } else {
-            result[0] = 0;
-        }
-        int i = 1;
-        for (String sql : sqlRowsMap.keySet()) {
-            ok = router.ExecuteInsert(db, sql, sqlRowsMap.get(sql), status);
+        for (int i = 0; i < batchValues.size(); i++) {
+            AbstractMap.SimpleImmutableEntry<ByteBuffer, ByteBuffer> pair = batchValues.get(i);
+            boolean ok = router.ExecuteInsert(cache.getDatabase(), cache.getName(),
+                    cache.getTid(), cache.getPartitionNum(),
+                    pair.getKey().array(), pair.getKey().capacity(),
+                    pair.getValue().array(), pair.getValue().capacity(), cache.isPutIfAbsent(), status);
             if (!ok) {
-                result[i] = -1;
-            } else {
-                result[i] = 0;
+                // TODO(hw): may lost log, e.g. openmldb-batch online import in yarn mode?
+                logger.warn(status.ToString());
             }
-            i++;
+            result[i] = ok ? 0 : -1;
         }
         status.delete();
-        status = null;
+        clearParameters();
+        batchValues.clear();
         return result;
-    }
-
-    @Override
-    @Deprecated
-    public Connection getConnection() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean getMoreResults(int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public ResultSet getGeneratedKeys() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int executeUpdate(String s, int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int executeUpdate(String s, int[] ints) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int executeUpdate(String s, String[] strings) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean execute(String s, int i) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean execute(String s, int[] ints) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean execute(String s, String[] strings) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public int getResultSetHoldability() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    public boolean isClosed() throws SQLException {
-        return closed;
-    }
-
-    @Override
-    @Deprecated
-    public void setPoolable(boolean b) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean isPoolable() throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    public void closeOnCompletion() throws SQLException {
-        this.closeOnComplete = true;
-    }
-
-    @Override
-    public boolean isCloseOnCompletion() throws SQLException {
-        return this.closeOnComplete;
-    }
-
-    @Override
-    @Deprecated
-    public <T> T unwrap(Class<T> aClass) throws SQLException {
-        throw new SQLException("current do not support this method");
-    }
-
-    @Override
-    @Deprecated
-    public boolean isWrapperFor(Class<?> aClass) throws SQLException {
-        throw new SQLException("current do not support this method");
     }
 }

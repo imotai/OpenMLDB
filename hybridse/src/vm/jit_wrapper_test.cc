@@ -55,7 +55,7 @@ std::shared_ptr<SqlCompileInfo> Compile(
     BatchRunSession session;
     Engine engine(catalog, options);
     if (!engine.Get(sql, "db", session, status)) {
-        LOG(WARNING) << "Fail to compile sql";
+        LOG(WARNING) << "Fail to compile sql. error " << status.msg;
         return nullptr;
     }
     return std::dynamic_pointer_cast<SqlCompileInfo>(session.GetCompileInfo());
@@ -83,7 +83,6 @@ void simple_test(const EngineOptions &options) {
     ASSERT_FALSE(ir_str.empty());
     HybridSeJitWrapper *jit = HybridSeJitWrapper::Create();
     ASSERT_TRUE(jit->Init());
-    HybridSeJitWrapper::InitJitSymbols(jit);
 
     base::RawBuffer ir_buf(const_cast<char *>(ir_str.data()), ir_str.size());
     ASSERT_TRUE(jit->AddModuleFromBuffer(ir_buf));
@@ -151,7 +150,6 @@ TEST_F(JitWrapperTest, test_window) {
     ASSERT_FALSE(ir_str.empty());
     HybridSeJitWrapper *jit = HybridSeJitWrapper::Create();
     ASSERT_TRUE(jit->Init());
-    HybridSeJitWrapper::InitJitSymbols(jit);
 
     base::RawBuffer ir_buf(const_cast<char *>(ir_str.data()), ir_str.size());
     ASSERT_TRUE(jit->AddModuleFromBuffer(ir_buf));

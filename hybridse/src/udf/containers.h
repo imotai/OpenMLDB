@@ -22,7 +22,10 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <set>
+#include <utility>
 
+#include "base/type.h"
 #include "codec/type_codec.h"
 #include "udf/literal_traits.h"
 #include "udf/udf.h"
@@ -41,7 +44,8 @@ struct ContainerStorageTypeTrait {
 };
 
 template <>
-struct ContainerStorageTypeTrait<codec::StringRef> {
+struct ContainerStorageTypeTrait<openmldb::base::StringRef> {
+    // FIXME: StringRef do not own data, ref #2944
     using type = codec::StringRef;
     static codec::StringRef to_stored_value(codec::StringRef* t) {
         return t == nullptr ? codec::StringRef() : *t;
@@ -49,18 +53,18 @@ struct ContainerStorageTypeTrait<codec::StringRef> {
 };
 
 template <>
-struct ContainerStorageTypeTrait<codec::Date> {
-    using type = codec::Date;
-    static codec::Date to_stored_value(codec::Date* t) {
-        return t == nullptr ? codec::Date(0) : *t;
+struct ContainerStorageTypeTrait<openmldb::base::Date> {
+    using type = openmldb::base::Date;
+    static openmldb::base::Date to_stored_value(openmldb::base::Date* t) {
+        return t == nullptr ? openmldb::base::Date(0) : *t;
     }
 };
 
 template <>
-struct ContainerStorageTypeTrait<codec::Timestamp> {
-    using type = codec::Timestamp;
-    static codec::Timestamp to_stored_value(codec::Timestamp* t) {
-        return t == nullptr ? codec::Timestamp(0) : *t;
+struct ContainerStorageTypeTrait<openmldb::base::Timestamp> {
+    using type = openmldb::base::Timestamp;
+    static openmldb::base::Timestamp to_stored_value(openmldb::base::Timestamp* t) {
+        return t == nullptr ? openmldb::base::Timestamp(0) : *t;
     }
 };
 
@@ -112,6 +116,11 @@ class TopKContainer {
         }
         // allocate string buffer
         char* buffer = udf::v1::AllocManagedStringBuf(str_len);
+        if (buffer == nullptr) {
+            output->size_ = 0;
+            output->data_ = "";
+            return;
+        }
         // fill string buffer
         char* cur = buffer;
         uint32_t remain_space = str_len;
@@ -156,22 +165,56 @@ class TopKContainer {
     BoundT bound_ = -1;  // delayed to be set by first push
 };
 
+template <typename K, typename V>
+struct DefaultPairCmp {
+    template <typename>
+    struct is_pair : std::false_type {};
+    template <typename... T>
+    struct is_pair<std::pair<T...>> : std::true_type {};
+
+    // (4, 2), (1, 4), (2, 4)
+    template <typename U = V>
+    std::enable_if_t<!is_pair<U>::value, bool> operator()(const std::pair<K, U>& lhs,
+                                                          const std::pair<K, U>& rhs) const {
+        if (lhs.second == rhs.second) {
+            return lhs.first < rhs.first;
+        }
+
+        return lhs.second < rhs.second;
+    }
+
+    // For AVG cate, StorageV is pair(int, double)
+    template <typename U = V>
+    std::enable_if_t<std::is_same_v<U, std::pair<int64_t, double>>, bool> operator()(
+        const std::pair<K, U>& lhs, const std::pair<K, U>& rhs) const {
+        double lavg = lhs.second.second / lhs.second.first;
+        double ravg = rhs.second.second / rhs.second.first;
+        if (lavg == ravg) {
+            return lhs.first < rhs.first;
+        }
+
+        return lavg < ravg;
+    }
+};
+
 template <typename K, typename V,
-          typename StorageV = typename ContainerStorageTypeTrait<V>::type>
+          typename StorageV = typename ContainerStorageTypeTrait<V>::type,
+          template <typename, typename> typename PairCmp = DefaultPairCmp>
 class BoundedGroupByDict {
  public:
-    // actual input type
+    // export data types
+    using Key = K;
+    using Value = V;
+    using StorageValue = StorageV;
     using InputK = typename DataTypeTrait<K>::CCallArgType;
     using InputV = typename DataTypeTrait<V>::CCallArgType;
-
     // actual stored type
     using StorageK = typename ContainerStorageTypeTrait<K>::type;
 
     // self type
-    using ContainerT = BoundedGroupByDict<K, V, StorageV>;
+    using ContainerT = BoundedGroupByDict<K, V, StorageV, PairCmp>;
 
-    using FormatValueF =
-        std::function<uint32_t(const StorageV&, char*, size_t)>;
+    using FormatValueF = std::function<uint32_t(const StorageV&, char*, size_t)>;
 
     // convert to internal key and value
     static inline StorageK to_stored_key(const InputK& key) {
@@ -241,8 +284,19 @@ class BoundedGroupByDict {
             }
         }
 
+        if (str_len == 0) {
+            output->size_ = 0;
+            output->data_ = "";
+            return;
+        }
+
         // allocate string buffer
         char* buffer = udf::v1::AllocManagedStringBuf(str_len);
+        if (buffer == nullptr) {
+            output->size_ = 0;
+            output->data_ = "";
+            return;
+        }
 
         // fill string buffer
         char* cur = buffer;
@@ -293,10 +347,81 @@ class BoundedGroupByDict {
             str_len - 1;  // must leave one '\0' for string format impl
     }
 
-    std::map<StorageK, StorageV>& map() { return map_; }
+
+    // fetch top n elements in `map_` order by value of map in desc.
+    // return string with the format of `key1:value1,key2:value...`.
+    void OutputTopNByValue(int64_t topn, const FormatValueF& format_value, codec::StringRef* output) {
+        if (map_.empty()) {
+            output->size_ = 0;
+            output->data_ = "";
+            return;
+        }
+        std::set<std::pair<StorageK, StorageV>, PairCmp<StorageK, StorageV>> ordered_set;
+        for (auto& kv : map_) {
+            ordered_set.emplace(kv.first, kv.second);
+
+            if (topn >= 0 && ordered_set.size() > static_cast<uint64_t>(topn)) {
+                ordered_set.erase(ordered_set.begin());
+            }
+        }
+
+        uint32_t outlen = 0;
+        auto it = ordered_set.crbegin();
+        auto end = ordered_set.crend();
+        auto stop_it = ordered_set.crend();
+
+        for (; it != end; ++it) {
+            uint32_t key_len = v1::to_string_len(it->first);
+            uint32_t value_len = format_value(it->second, nullptr, 0);
+            uint32_t new_len = outlen + key_len + value_len + 2;  // "k:v,"
+            if (new_len > MAX_OUTPUT_STR_SIZE) {
+                stop_it = it;
+                break;
+            } else {
+                outlen = new_len;
+            }
+        }
+
+        if (outlen == 0) {
+            output->size_ = 0;
+            output->data_ = "";
+            return;
+        }
+
+        // allocate string buffer
+        char* buffer = udf::v1::AllocManagedStringBuf(outlen);
+        if (buffer == nullptr) {
+            output->size_ = 0;
+            output->data_ = "";
+            return;
+        }
+
+        char* cur = buffer;
+        uint32_t remain_space = outlen;
+        auto cur_it = ordered_set.crbegin();
+        for (; cur_it != stop_it; ++cur_it) {
+            uint32_t key_len = v1::format_string(cur_it->first, cur, remain_space);
+            cur += key_len;
+            *(cur++) = ':';
+            remain_space -= key_len + 1;
+
+            uint32_t value_len = format_value(cur_it->second, cur, remain_space);
+            cur += value_len;
+            remain_space -= value_len;
+            if (remain_space-- > 0) {
+                *(cur++) = ',';
+            }
+        }
+
+        *(buffer + outlen - 1) = '\0';
+        output->data_ = buffer;
+        output->size_ = outlen - 1;  // must leave one '\0' for string format impl
+    }
+
+    auto& map() { return map_; }
 
  private:
-    std::map<StorageK, StorageV> map_;
+    std::map<StorageK, StorageV, std::less<StorageK>> map_;
 
     static const size_t MAX_OUTPUT_STR_SIZE = 4096;
 };

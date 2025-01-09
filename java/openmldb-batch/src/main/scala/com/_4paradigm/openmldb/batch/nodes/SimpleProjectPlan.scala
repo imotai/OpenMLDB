@@ -19,9 +19,9 @@ package com._4paradigm.openmldb.batch.nodes
 import com._4paradigm.hybridse.sdk.UnsupportedHybridSeException
 import com._4paradigm.hybridse.node.{CastExprNode, ConstNode, ExprNode, ExprType, DataType => HybridseDataType}
 import com._4paradigm.hybridse.vm.{CoreAPI, PhysicalSimpleProjectNode}
-import com._4paradigm.openmldb.batch.utils.{HybridseUtil, SparkColumnUtil}
+import com._4paradigm.openmldb.batch.utils.{DataTypeUtil, ExpressionUtil, HybridseUtil, SparkColumnUtil}
 import com._4paradigm.openmldb.batch.{PlanContext, SparkInstance}
-import org.apache.spark.sql.{Column, DataFrame}
+import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters.asScalaBufferConverter
@@ -48,16 +48,16 @@ object SimpleProjectPlan {
     ).toList
 
     val outputColTypeList = outputSchema.asScala.map(col =>
-      HybridseUtil.getInnerTypeFromSchemaType(col.getType)
+      DataTypeUtil.hybridseProtoTypeToOpenmldbType(col.getType)
     ).toList
 
     val selectColList = mutable.ArrayBuffer[Column]()
 
     for (i <- 0 until node.project().size.toInt) {
       val expr = node.project().GetExpr(i)
-      val (col, innerType) = createSparkColumn(inputDf, node, expr)
+      val (col, innerType) = createSparkColumn(ctx.getSparkSession, inputDf, node, expr)
       val castOutputCol = ConstProjectPlan.castSparkOutputCol(
-        col, outputColTypeList(i), innerType)
+        ctx.getSparkSession, col, outputColTypeList(i), innerType)
       castOutputCol.alias(outputColNameList(i))
 
       selectColList.append(castOutputCol.alias(outputColNameList(i)))
@@ -79,7 +79,8 @@ object SimpleProjectPlan {
     * @param expr    Simple project expression
     * @return   Spark column instance compatible with inner expression
     */
-  def createSparkColumn(inputDf: DataFrame,
+  def createSparkColumn(spark: SparkSession,
+                        inputDf: DataFrame,
                         node: PhysicalSimpleProjectNode,
                         expr: ExprNode): (Column, HybridseDataType) = {
     expr.GetExprType() match {
@@ -94,21 +95,25 @@ object SimpleProjectPlan {
         }
         val sparkCol = SparkColumnUtil.getColumnFromIndex(inputDf, colIndex)
         val sparkType = inputDf.schema(colIndex).dataType
-        val schemaType = HybridseUtil.getHybridseType(sparkType)
-        val innerType = HybridseUtil.getInnerTypeFromSchemaType(schemaType)
+        val schemaType = DataTypeUtil.sparkTypeToHybridseProtoType(sparkType)
+        if (!schemaType.hasBaseType()) {
+          throw new UnsupportedHybridSeException(
+            s"expression output type does not expect to be ${schemaType} for simple project")
+        }
+        val innerType = DataTypeUtil.hybridseProtoTypeToOpenmldbType(schemaType.getBaseType())
         sparkCol -> innerType
 
       case ExprType.kExprPrimary =>
         val const = ConstNode.CastFrom(expr)
-        ConstProjectPlan.getConstCol(const) -> const.GetDataType
+        ExpressionUtil.constExprToSparkColumn(const) -> const.GetDataType
 
       case ExprType.kExprCast =>
         val cast = CastExprNode.CastFrom(expr)
-        val castType = cast.getCast_type_
+        val castType = cast.base_cast_type
         val (childCol, childType) =
-          createSparkColumn(inputDf, node, cast.GetChild(0))
+          createSparkColumn(spark, inputDf, node, cast.GetChild(0))
         val castColumn = ConstProjectPlan.castSparkOutputCol(
-          childCol, childType, castType)
+          spark, childCol, childType, castType)
         castColumn -> castType
 
       case _ => throw new UnsupportedHybridSeException(

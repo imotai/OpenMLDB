@@ -34,27 +34,34 @@ namespace catalog {
 
 TabletTableHandler::TabletTableHandler(const ::openmldb::api::TableMeta& meta,
                                        std::shared_ptr<hybridse::vm::Tablet> local_tablet)
-    : schema_(),
+    : partition_num_(meta.table_partition_size()),
+      schema_(),
       table_st_(meta),
       tables_(std::make_shared<Tables>()),
       types_(),
-      index_list_(),
-      index_hint_(),
+      index_pos_(0),
+      index_hint_vec_(),
       table_client_manager_(),
       local_tablet_(local_tablet) {}
 
 TabletTableHandler::TabletTableHandler(const ::openmldb::nameserver::TableInfo& meta,
                                        std::shared_ptr<hybridse::vm::Tablet> local_tablet)
-    : schema_(),
+    : partition_num_(meta.table_partition_size()),
+      schema_(),
       table_st_(meta),
       tables_(std::make_shared<Tables>()),
       types_(),
-      index_list_(),
-      index_hint_(),
+      index_pos_(0),
+      index_hint_vec_(),
       table_client_manager_(),
       local_tablet_(local_tablet) {}
 
 bool TabletTableHandler::Init(const ClientManager& client_manager) {
+    if (partition_num_ == 0) {
+        // some test cases not set table_partition
+        partition_num_ = 1;
+    }
+    index_hint_vec_.resize(partition_num_);
     bool ok = schema::SchemaAdapter::ConvertSchema(table_st_.GetColumns(), &schema_);
     if (!ok) {
         LOG(WARNING) << "fail to covert schema to sql schema";
@@ -64,7 +71,7 @@ bool TabletTableHandler::Init(const ClientManager& client_manager) {
     for (int32_t i = 0; i < schema_.size(); i++) {
         const ::hybridse::type::ColumnDef& column = schema_.Get(i);
         ::hybridse::vm::ColInfo col_info;
-        col_info.type = column.type();
+        col_info.schema.set_base_type(column.type());
         col_info.idx = i;
         col_info.name = column.name();
         types_.insert(std::make_pair(column.name(), col_info));
@@ -81,29 +88,27 @@ bool TabletTableHandler::Init(const ClientManager& client_manager) {
 
 bool TabletTableHandler::UpdateIndex(
         const ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnKey>& indexs) {
-    index_list_.Clear();
-    index_hint_.clear();
-    if (!schema::IndexUtil::ConvertIndex(indexs, &index_list_)) {
-        LOG(WARNING) << "fail to conver index to sql index";
-        return false;
-    }
-    // init index hint
-    for (int32_t i = 0; i < index_list_.size(); i++) {
-        const ::hybridse::type::IndexDef& index_def = index_list_.Get(i);
+    int pos = (index_pos_.load() + 1) % partition_num_;
+    index_hint_vec_[pos].clear();
+    for (int32_t i = 0; i < indexs.size(); i++) {
+        const auto& column_key = indexs.Get(i);
+        if (column_key.flag() != 0) {
+            continue;
+        }
         ::hybridse::vm::IndexSt index_st;
         index_st.index = i;
         index_st.ts_pos = ::hybridse::vm::INVALID_POS;
-        if (!index_def.second_key().empty()) {
-            int32_t pos = GetColumnIndex(index_def.second_key());
+        if (!column_key.ts_name().empty()) {
+            int32_t pos = GetColumnIndex(column_key.ts_name());
             if (pos < 0) {
-                LOG(WARNING) << "fail to get second key " << index_def.second_key();
+                LOG(WARNING) << "fail to get second key " << column_key.ts_name();
                 return false;
             }
             index_st.ts_pos = pos;
         }
-        index_st.name = index_def.name();
-        for (int32_t j = 0; j < index_def.first_keys_size(); j++) {
-            const std::string& key = index_def.first_keys(j);
+        index_st.name = column_key.index_name();
+        for (int32_t j = 0; j < column_key.col_name_size(); j++) {
+            const std::string& key = column_key.col_name(j);
             auto it = types_.find(key);
             if (it == types_.end()) {
                 LOG(WARNING) << "column " << key << " does not exist in table " << GetName();
@@ -111,32 +116,45 @@ bool TabletTableHandler::UpdateIndex(
             }
             index_st.keys.push_back(it->second);
         }
-        index_hint_.insert(std::make_pair(index_st.name, index_st));
+        index_hint_vec_[pos].emplace(index_st.name, index_st);
     }
+    index_pos_.store(pos, std::memory_order_release);
     return true;
 }
 
+const ::hybridse::vm::IndexHint& TabletTableHandler::GetIndex() {
+    return index_hint_vec_.at(index_pos_.load(std::memory_order_acquire));
+}
+
 std::unique_ptr<::hybridse::codec::RowIterator> TabletTableHandler::GetIterator() {
-    auto tables = std::atomic_load_explicit(&tables_, std::memory_order_acquire);
-    if (!tables->empty()) {
-        return std::unique_ptr<catalog::FullTableIterator>(new catalog::FullTableIterator(tables));
-    }
-    return std::unique_ptr<::hybridse::codec::RowIterator>();
+    return std::unique_ptr<::hybridse::codec::RowIterator>(GetRawIterator());
 }
 
 std::unique_ptr<::hybridse::codec::WindowIterator> TabletTableHandler::GetWindowIterator(const std::string& idx_name) {
-    auto iter = index_hint_.find(idx_name);
-    if (iter == index_hint_.end()) {
+    const auto& index_hint = GetIndex();
+    auto iter = index_hint.find(idx_name);
+    if (iter == index_hint.end()) {
         LOG(WARNING) << "index name " << idx_name << " not exist";
         return std::unique_ptr<::hybridse::codec::WindowIterator>();
     }
     DLOG(INFO) << "get window it with index " << idx_name;
     auto tables = std::atomic_load_explicit(&tables_, std::memory_order_acquire);
-    if (!tables->empty()) {
-        return std::unique_ptr<::hybridse::codec::WindowIterator>(
-            new DistributeWindowIterator(tables, iter->second.index));
+    if (!tables) {
+        LOG(WARNING) << " tables is null";
+        return {};
     }
-    return std::unique_ptr<::hybridse::codec::WindowIterator>();
+    std::map<uint32_t, std::shared_ptr<openmldb::client::TabletClient>> tablet_clients;
+    for (uint32_t pid = 0; pid < partition_num_; pid++) {
+        if (tables->count(pid) == 0) {
+            auto accessor = table_client_manager_->GetTablet(pid);
+            if (accessor) {
+                tablet_clients.emplace(pid, accessor->GetClient());
+            }
+        }
+    }
+    DLOG(INFO) << "table size " << tables->size() << " tablet_clients size " << tablet_clients.size();
+    return std::make_unique<DistributeWindowIterator>(GetTid(), partition_num_, tables,
+            iter->second.index, idx_name, tablet_clients);
 }
 
 // TODO(chenjing): optimize Get(int pos) base segment
@@ -150,10 +168,17 @@ const ::hybridse::codec::Row TabletTableHandler::Get(int32_t pos) {
 
 ::hybridse::codec::RowIterator* TabletTableHandler::GetRawIterator() {
     auto tables = std::atomic_load_explicit(&tables_, std::memory_order_acquire);
-    if (!tables->empty()) {
-        return new catalog::FullTableIterator(tables);
+    std::map<uint32_t, std::shared_ptr<openmldb::client::TabletClient>> tablet_clients;
+    for (uint32_t pid = 0; pid < partition_num_; pid++) {
+        if (tables->count(pid) == 0) {
+            auto accessor = table_client_manager_->GetTablet(pid);
+            if (accessor) {
+                tablet_clients.emplace(pid, accessor->GetClient());
+            }
+        }
     }
-    return nullptr;
+    DLOG(INFO) << "table size " << tables->size() << " tablet_clients size " << tablet_clients.size();
+    return new catalog::FullTableIterator(GetTid(), tables, tablet_clients);
 }
 
 const uint64_t TabletTableHandler::GetCount() {
@@ -175,7 +200,7 @@ const uint64_t TabletTableHandler::GetCount() {
 }
 
 std::shared_ptr<::hybridse::vm::PartitionHandler> TabletTableHandler::GetPartition(const std::string& index_name) {
-    if (index_hint_.find(index_name) == index_hint_.cend()) {
+    if (GetIndex().count(index_name) == 0) {
         LOG(WARNING) << "fail to get partition for tablet table handler, index name " << index_name;
         return std::shared_ptr<::hybridse::vm::PartitionHandler>();
     }
@@ -188,7 +213,7 @@ void TabletTableHandler::AddTable(std::shared_ptr<::openmldb::storage::Table> ta
     do {
         old_tables = std::atomic_load_explicit(&tables_, std::memory_order_acquire);
         new_tables = std::make_shared<Tables>(*old_tables);
-        new_tables->emplace(table->GetPid(), table);
+        new_tables->insert_or_assign(table->GetPid(), table);
     } while (!atomic_compare_exchange_weak(&tables_, &old_tables, new_tables));
 }
 
@@ -207,19 +232,39 @@ int TabletTableHandler::DeleteTable(uint32_t pid) {
     return new_tables->size();
 }
 
-void TabletTableHandler::Update(const ::openmldb::nameserver::TableInfo& meta, const ClientManager& client_manager) {
+bool TabletTableHandler::Update(const ::openmldb::nameserver::TableInfo& meta, const ClientManager& client_manager,
+        bool* index_updated) {
+    *index_updated = false;
     ::openmldb::storage::TableSt new_table_st(meta);
     for (const auto& partition_st : *(new_table_st.GetPartitions())) {
         uint32_t pid = partition_st.GetPid();
-        if (partition_st == table_st_.GetPartition(pid)) {
-            continue;
+        if (!(partition_st == table_st_.GetPartition(pid))) {
+            table_st_.SetPartition(partition_st);
         }
-        table_st_.SetPartition(partition_st);
         table_client_manager_->UpdatePartitionClientManager(partition_st, client_manager);
     }
-    if (meta.column_key_size() != index_list_.size()) {
-        UpdateIndex(meta.column_key());
+    const auto& index_hint = GetIndex();
+    size_t index_cnt = 0;
+    bool has_new_index = false;
+    for (const auto& column_key : meta.column_key()) {
+        if (column_key.flag() != 0) {
+            continue;
+        }
+        index_cnt++;
+        if (index_hint.find(column_key.index_name()) == index_hint.end()) {
+            has_new_index = true;
+            break;
+        }
     }
+    if (index_cnt != index_hint.size() || has_new_index) {
+        LOG(INFO) << "index size changed. current index size " << index_hint.size()
+            << " , new index size " << index_cnt;
+        if (!UpdateIndex(meta.column_key())) {
+            return false;
+        }
+        *index_updated = true;
+    }
+    return true;
 }
 
 std::shared_ptr<::hybridse::vm::Tablet> TabletTableHandler::GetTablet(const std::string& index_name,
@@ -248,7 +293,7 @@ std::shared_ptr<::hybridse::vm::Tablet> TabletTableHandler::GetTablet(const std:
 
 std::shared_ptr<::hybridse::vm::Tablet> TabletTableHandler::GetTablet(const std::string& index_name,
                                                                       const std::vector<std::string>& pks) {
-    std::shared_ptr<TabletsAccessor> tablets_accessor = std::shared_ptr<TabletsAccessor>(new TabletsAccessor());
+    auto tablets_accessor = std::make_shared<TabletsAccessor>();
     for (const auto& pk : pks) {
         auto tablet_accessor = GetTablet(index_name, pk);
         if (tablet_accessor) {
@@ -262,7 +307,14 @@ std::shared_ptr<::hybridse::vm::Tablet> TabletTableHandler::GetTablet(const std:
 }
 
 TabletCatalog::TabletCatalog()
-    : mu_(), tables_(), db_(), db_sp_map_(), client_manager_(), version_(1), local_tablet_() {}
+    : mu_(),
+      tables_(),
+      db_(),
+      db_sp_map_(),
+      client_manager_(),
+      version_(1),
+      local_tablet_(),
+      aggr_tables_(std::make_shared<AggrTableMap>()) {}
 
 TabletCatalog::~TabletCatalog() {}
 
@@ -307,15 +359,24 @@ bool TabletCatalog::AddTable(const ::openmldb::api::TableMeta& meta,
     }
     const std::string& table_name = meta.name();
     auto it = db_it->second.find(table_name);
-    if (it == db_it->second.end()) {
+    if (it != db_it->second.end()) {
+        if (it->second->GetTid() < static_cast<uint32_t>(meta.tid())) {
+            db_it->second.erase(it);
+        } else if (it->second->GetTid() > static_cast<uint32_t>(meta.tid())) {
+            LOG(WARNING) << "current tid " << it->second->GetTid() << " is greater than new table info tid "
+                << meta.tid();
+            return false;
+        } else {
+            handler = it->second;
+        }
+    }
+    if (!handler) {
         handler = std::make_shared<TabletTableHandler>(meta, local_tablet_);
         if (!handler->Init(client_manager_)) {
             LOG(WARNING) << "tablet handler init failed";
             return false;
         }
         db_it->second.emplace(table_name, handler);
-    } else {
-        handler = it->second;
     }
     handler->AddTable(table);
     return true;
@@ -331,7 +392,7 @@ bool TabletCatalog::AddDB(const ::hybridse::type::Database& db) {
     return true;
 }
 
-bool TabletCatalog::DeleteTable(const std::string& db, const std::string& table_name, uint32_t pid) {
+bool TabletCatalog::DeleteTable(const std::string& db, const std::string& table_name, uint32_t tid, uint32_t pid) {
     std::lock_guard<::openmldb::base::SpinMutex> spin_lock(mu_);
     auto db_it = tables_.find(db);
     if (db_it == tables_.end()) {
@@ -341,7 +402,11 @@ bool TabletCatalog::DeleteTable(const std::string& db, const std::string& table_
     if (it == db_it->second.end()) {
         return false;
     }
-    LOG(INFO) << "delete table from catalog. db " << db << ", name " << table_name << ", pid " << pid;
+    if (it->second->GetTid() > tid) {
+        LOG(WARNING) << "delete failed. current tid " << it->second->GetTid() << " is greater than " << tid;
+        return false;
+    }
+    LOG(INFO) << "delete table from catalog. db " << db << " name " << table_name << " tid " << tid << " pid " << pid;
     if (it->second->DeleteTable(pid) < 1) {
         db_it->second.erase(it);
     }
@@ -371,7 +436,7 @@ bool TabletCatalog::DropProcedure(const std::string& db, const std::string& sp_n
     std::lock_guard<::openmldb::base::SpinMutex> spin_lock(mu_);
     auto db_it = db_sp_map_.find(db);
     if (db_it == db_sp_map_.end()) {
-        LOG(WARNING) << "db " << db << " not exist";
+        LOG(WARNING) << "db " << db << " not exist in sp map";
         return false;
     }
     auto& sp_map = db_it->second;
@@ -388,25 +453,27 @@ bool TabletCatalog::UpdateTableMeta(const ::openmldb::api::TableMeta& meta) {
     const std::string& db_name = meta.db();
     const std::string& table_name = meta.name();
     std::shared_ptr<TabletTableHandler> handler;
-    {
-        std::lock_guard<::openmldb::base::SpinMutex> spin_lock(mu_);
-        auto db_it = tables_.find(db_name);
-        if (db_it == tables_.end()) {
-            LOG(WARNING) << "db " << db_name << " is not exist";
-            return false;
-        }
-        auto it = db_it->second.find(table_name);
-        if (it == db_it->second.end()) {
-            LOG(WARNING) << "table " << table_name << " is not exist in db " << db_name;
-            return false;
-        } else {
-            handler = it->second;
-        }
+    std::lock_guard<::openmldb::base::SpinMutex> spin_lock(mu_);
+    auto db_it = tables_.find(db_name);
+    if (db_it == tables_.end()) {
+        LOG(WARNING) << "db " << db_name << " does not exist";
+        return false;
+    }
+    auto it = db_it->second.find(table_name);
+    if (it == db_it->second.end()) {
+        LOG(WARNING) << "table " << table_name << " does not exist in db " << db_name;
+        return false;
+    } else if (it->second->GetTid() != static_cast<uint32_t>(meta.tid())) {
+        LOG(WARNING) << "tid is not match. tid " << it->second->GetTid() << " new tid " << meta.tid();
+        return false;
+    } else {
+        handler = it->second;
     }
     return handler->UpdateIndex(meta.column_key());
 }
 
-bool TabletCatalog::UpdateTableInfo(const ::openmldb::nameserver::TableInfo& table_info) {
+bool TabletCatalog::UpdateTableInfo(const ::openmldb::nameserver::TableInfo& table_info, bool* index_updated) {
+    *index_updated = false;
     const std::string& db_name = table_info.db();
     const std::string& table_name = table_info.name();
     std::shared_ptr<TabletTableHandler> handler;
@@ -418,24 +485,38 @@ bool TabletCatalog::UpdateTableInfo(const ::openmldb::nameserver::TableInfo& tab
             db_it = result.first;
         }
         auto it = db_it->second.find(table_name);
-        if (it == db_it->second.end()) {
+        if (it != db_it->second.end()) {
+            if (table_info.tid() > it->second->GetTid()) {
+                db_it->second.erase(it);
+            } else if (table_info.tid() < it->second->GetTid()) {
+                LOG(INFO) << "current tid " << it->second->GetTid() << " is greater than new table info tid "
+                    << table_info.tid();
+                return false;
+            } else {
+                handler = it->second;
+            }
+        }
+        if (!handler) {
             handler = std::make_shared<TabletTableHandler>(table_info, local_tablet_);
             if (!handler->Init(client_manager_)) {
                 LOG(WARNING) << "tablet handler init failed";
                 return false;
             }
             db_it->second.emplace(table_name, handler);
-            LOG(INFO) << "add table " << table_name << " db " << db_name;
-        } else {
-            handler = it->second;
+            LOG(INFO) << "add table " << table_name << " to db " << db_name << " tid " << table_info.tid();
+        }
+        if (bool updated = false; !handler->Update(table_info, client_manager_, &updated)) {
+            return false;
+        } else if (updated) {
+            *index_updated = true;
         }
     }
-    handler->Update(table_info, client_manager_);
     return true;
 }
 
 void TabletCatalog::Refresh(const std::vector<::openmldb::nameserver::TableInfo>& table_info_vec, uint64_t version,
-                            const Procedures& db_sp_map) {
+                            const Procedures& db_sp_map, bool* updated) {
+    *updated = false;
     std::map<std::string, std::set<std::string>> table_map;
     for (const auto& table_info : table_info_vec) {
         const std::string& db_name = table_info.db();
@@ -443,8 +524,10 @@ void TabletCatalog::Refresh(const std::vector<::openmldb::nameserver::TableInfo>
         if (db_name.empty()) {
             continue;
         }
-        if (!UpdateTableInfo(table_info)) {
+        if (bool index_updated = false; !UpdateTableInfo(table_info, &index_updated)) {
             continue;
+        } else if (index_updated) {
+            *updated = true;
         }
         auto cur_db_it = table_map.find(db_name);
         if (cur_db_it == table_map.end()) {
@@ -467,6 +550,7 @@ void TabletCatalog::Refresh(const std::vector<::openmldb::nameserver::TableInfo>
                 !table_it->second->HasLocalTable()) {
                 LOG(INFO) << "delete table from catalog. db: " << db_it->first << ", table: " << table_it->first;
                 table_it = db_it->second.erase(table_it);
+                *updated = true;
                 continue;
             }
             ++table_it;
@@ -502,6 +586,72 @@ std::shared_ptr<::hybridse::sdk::ProcedureInfo> TabletCatalog::GetProcedureInfo(
 const Procedures& TabletCatalog::GetProcedures() {
     std::lock_guard<::openmldb::base::SpinMutex> spin_lock(mu_);
     return db_sp_map_;
+}
+
+std::vector<::hybridse::vm::AggrTableInfo> TabletCatalog::GetAggrTables(
+    const std::string& base_db, const std::string& base_table, const std::string& aggr_func,
+    const std::string& aggr_col, const std::string& partition_cols, const std::string& order_col,
+    const std::string& filter_col) {
+    AggrTableKey key{base_db, base_table, aggr_func, aggr_col, partition_cols, order_col, filter_col};
+    auto aggr_tables = std::atomic_load_explicit(&aggr_tables_, std::memory_order_acquire);
+    return (*aggr_tables)[key];
+}
+
+void TabletCatalog::RefreshAggrTables(const std::vector<::hybridse::vm::AggrTableInfo>& table_infos) {
+    auto new_aggr_tables = std::make_shared<AggrTableMap>();
+    for (const auto& table_info : table_infos) {
+        // TODO(zhanghao): can use AggrTableKey *table_key = static_cast<AggrTableKey*>(&table_info);
+        AggrTableKey table_key{table_info.base_db,   table_info.base_table,     table_info.aggr_func,
+                               table_info.aggr_col,  table_info.partition_cols, table_info.order_by_col,
+                               table_info.filter_col};
+        if (new_aggr_tables->count(table_key) == 0) {
+            new_aggr_tables->emplace(std::move(table_key),
+                                     std::vector<::hybridse::vm::AggrTableInfo>{std::move(table_info)});
+        } else {
+            new_aggr_tables->at(table_key).push_back(std::move(table_info));
+        }
+    }
+
+    atomic_store_explicit(&aggr_tables_, new_aggr_tables, std::memory_order_relaxed);
+}
+
+std::unique_ptr<::hybridse::vm::RowIterator> TabletSegmentHandler::GetIterator() {
+    auto iter = partition_handler_->GetWindowIterator();
+    if (iter) {
+        DLOG(INFO) << "seek to pk " << key_;
+        iter->Seek(key_);
+        if (iter->Valid() && 0 == iter->GetKey().compare(hybridse::codec::Row(key_))) {
+            return std::move(iter->GetValue());
+        } else {
+            return std::unique_ptr<::hybridse::vm::RowIterator>();
+        }
+    }
+    return std::unique_ptr<::hybridse::vm::RowIterator>();
+}
+
+::hybridse::vm::RowIterator* TabletSegmentHandler::GetRawIterator() {
+    auto iter = partition_handler_->GetWindowIterator();
+    if (iter) {
+        DLOG(INFO) << "seek to pk " << key_;
+        iter->Seek(key_);
+        if (iter->Valid() && 0 == iter->GetKey().compare(hybridse::codec::Row(key_))) {
+            return iter->GetRawValue();
+        } else {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+const uint64_t TabletSegmentHandler::GetCount() {
+    auto iter = GetIterator();
+    if (!iter) return 0;
+    uint64_t cnt = 0;
+    while (iter->Valid()) {
+        cnt++;
+        iter->Next();
+    }
+    return cnt;
 }
 
 }  // namespace catalog

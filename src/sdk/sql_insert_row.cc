@@ -19,7 +19,9 @@
 #include <stdint.h>
 
 #include <string>
+#include <utility>
 
+#include "codec/codec.h"
 #include "glog/logging.h"
 
 namespace openmldb {
@@ -27,29 +29,35 @@ namespace sdk {
 
 SQLInsertRows::SQLInsertRows(std::shared_ptr<::openmldb::nameserver::TableInfo> table_info,
                              std::shared_ptr<hybridse::sdk::Schema> schema, DefaultValueMap default_map,
-                             uint32_t default_str_length)
-    : table_info_(table_info), schema_(schema), default_map_(default_map), default_str_length_(default_str_length) {}
+                             uint32_t default_str_length, const std::vector<uint32_t>& hole_idx_arr, bool put_if_absent)
+    : table_info_(std::move(table_info)),
+      schema_(std::move(schema)),
+      default_map_(std::move(default_map)),
+      default_str_length_(default_str_length),
+      hole_idx_arr_(hole_idx_arr),
+      put_if_absent_(put_if_absent) {}
 
 std::shared_ptr<SQLInsertRow> SQLInsertRows::NewRow() {
     if (!rows_.empty() && !rows_.back()->IsComplete()) {
-        return std::shared_ptr<SQLInsertRow>();
+        return {};
     }
-    std::shared_ptr<SQLInsertRow> row =
-        std::make_shared<SQLInsertRow>(table_info_, schema_, default_map_, default_str_length_);
+    std::shared_ptr<SQLInsertRow> row = std::make_shared<SQLInsertRow>(
+        table_info_, schema_, default_map_, default_str_length_, hole_idx_arr_, put_if_absent_);
     rows_.push_back(row);
     return row;
 }
 
 SQLInsertRow::SQLInsertRow(std::shared_ptr<::openmldb::nameserver::TableInfo> table_info,
                            std::shared_ptr<hybridse::sdk::Schema> schema, DefaultValueMap default_map,
-                           uint32_t default_string_length)
+                           uint32_t default_string_length, bool put_if_absent)
     : table_info_(table_info),
-      schema_(schema),
-      default_map_(default_map),
+      schema_(std::move(schema)),
+      default_map_(std::move(default_map)),
       default_string_length_(default_string_length),
       rb_(table_info->column_desc()),
       val_(),
-      str_size_(0) {
+      str_size_(0),
+      put_if_absent_(put_if_absent) {
     std::map<std::string, uint32_t> column_name_map;
     for (int idx = 0; idx < table_info_->column_desc_size(); idx++) {
         column_name_map.emplace(table_info_->column_desc(idx).name(), idx);
@@ -58,22 +66,37 @@ SQLInsertRow::SQLInsertRow(std::shared_ptr<::openmldb::nameserver::TableInfo> ta
         index_map_.clear();
         raw_dimensions_.clear();
         for (int idx = 0; idx < table_info_->column_key_size(); ++idx) {
-            for (const auto& column : table_info_->column_key(idx).col_name()) {
+            const auto& index = table_info_->column_key(idx);
+            if (index.flag()) {
+                continue;
+            }
+            for (const auto& column : index.col_name()) {
                 index_map_[idx].push_back(column_name_map[column]);
                 raw_dimensions_[column_name_map[column]] = hybridse::codec::NONETOKEN;
             }
-            if (!table_info_->column_key(idx).ts_name().empty()) {
-                ts_set_.insert(column_name_map[table_info_->column_key(idx).ts_name()]);
+            if (!index.ts_name().empty()) {
+                ts_set_.insert(column_name_map[index.ts_name()]);
             }
         }
     }
 }
 
+SQLInsertRow::SQLInsertRow(std::shared_ptr<::openmldb::nameserver::TableInfo> table_info,
+                           std::shared_ptr<hybridse::sdk::Schema> schema, DefaultValueMap default_map,
+                           uint32_t default_str_length, std::vector<uint32_t> hole_idx_arr, bool put_if_absent)
+    : SQLInsertRow(std::move(table_info), std::move(schema), std::move(default_map), default_str_length,
+                   put_if_absent) {
+    hole_idx_arr_ = std::move(hole_idx_arr);
+}
+
 bool SQLInsertRow::Init(int str_length) {
+    if (is_codegen_row_) {
+        return true;
+    }
     str_size_ = str_length + default_string_length_;
     uint32_t row_size = rb_.CalTotalLength(str_size_);
     val_.resize(row_size);
-    int8_t* buf = reinterpret_cast<int8_t*>(&(val_[0]));
+    auto* buf = reinterpret_cast<int8_t*>(&(val_[0]));
     bool ok = rb_.SetBuffer(reinterpret_cast<int8_t*>(buf), row_size);
     if (!ok) {
         return false;
@@ -83,8 +106,6 @@ bool SQLInsertRow::Init(int str_length) {
 }
 
 void SQLInsertRow::PackDimension(const std::string& val) { raw_dimensions_[rb_.GetAppendPos()] = val; }
-
-
 
 const std::map<uint32_t, std::vector<std::pair<std::string, uint32_t>>>& SQLInsertRow::GetDimensions() {
     if (!dimensions_.empty()) {
@@ -101,14 +122,14 @@ const std::map<uint32_t, std::vector<std::pair<std::string, uint32_t>>>& SQLInse
             key += raw_dimensions_[idx];
         }
         if (pid_num > 0) {
-            pid = (uint32_t)(::openmldb::base::hash64(key) % pid_num);
+            pid = static_cast<uint32_t>(::openmldb::base::hash64(key) % pid_num);
         }
         auto iter = dimensions_.find(pid);
         if (iter == dimensions_.end()) {
             auto result = dimensions_.emplace(pid, std::vector<std::pair<std::string, uint32_t>>());
             iter = result.first;
         }
-        iter->second.push_back(std::make_pair(key, kv.first));
+        iter->second.emplace_back(key, kv.first);
     }
     return dimensions_;
 }
@@ -177,6 +198,9 @@ bool SQLInsertRow::AppendInt32(int32_t val) {
 }
 
 bool SQLInsertRow::AppendInt64(int64_t val) {
+    if (val < 0 && IsTsCol()) {
+        return false;
+    }
     if (IsDimension()) {
         PackDimension(std::to_string(val));
     }
@@ -187,6 +211,9 @@ bool SQLInsertRow::AppendInt64(int64_t val) {
 }
 
 bool SQLInsertRow::AppendTimestamp(int64_t val) {
+    if (val < 0) {
+        return false;
+    }
     if (IsDimension()) {
         PackDimension(std::to_string(val));
     }
@@ -241,16 +268,14 @@ bool SQLInsertRow::AppendString(const char* string_buffer_var_name, uint32_t len
 }
 
 bool SQLInsertRow::AppendDate(uint32_t year, uint32_t month, uint32_t day) {
+    uint32_t date = 0;
+    if (!openmldb::codec::RowBuilder::ConvertDate(year, month, day, &date)) {
+        return false;
+    }
     if (IsDimension()) {
-        if (year < 1900 || year > 9999) return false;
-        if (month < 1 || month > 12) return false;
-        if (day < 1 || day > 31) return false;
-        int32_t date = (year - 1900) << 16;
-        date = date | ((month - 1) << 8);
-        date = date | day;
         PackDimension(std::to_string(date));
     }
-    if (rb_.AppendDate(year, month, day)) {
+    if (rb_.AppendDate(date)) {
         return MakeDefault();
     }
     return false;
@@ -270,7 +295,7 @@ bool SQLInsertRow::AppendNULL() {
     if (IsDimension()) {
         PackDimension(hybridse::codec::NONETOKEN);
     }
-    if (ts_set_.count(rb_.GetAppendPos())) {
+    if (IsTsCol()) {
         return false;
     }
     if (rb_.AppendNULL()) {
@@ -279,9 +304,36 @@ bool SQLInsertRow::AppendNULL() {
     return false;
 }
 
-bool SQLInsertRow::IsComplete() { return rb_.IsComplete(); }
+bool SQLInsertRow::IsComplete() {
+    if (is_codegen_row_) {
+        return true;
+    }
+    return rb_.IsComplete();
+}
 
-bool SQLInsertRow::Build() { return str_size_ == 0; }
+bool SQLInsertRow::Build() const { return str_size_ == 0; }
+
+std::vector<uint32_t> SQLInsertRow::GetHoleIdxArr(const DefaultValueMap& default_map,
+                                                  const std::vector<uint32_t>& stmt_column_idx_in_table,
+                                                  const std::shared_ptr<::hybridse::sdk::Schema>& schema) {
+    std::vector<uint32_t> hole_idx_arr;
+    if (!stmt_column_idx_in_table.empty()) {
+        // hold idx arr should in stmt column order
+        for (auto idx : stmt_column_idx_in_table) {
+            // no default value means a hole, needs to set value
+            if (default_map->find(idx) == default_map->end()) {
+                hole_idx_arr.emplace_back(idx);
+            }
+        }
+    } else {
+        for (int i = 0; i < schema->GetColumnCnt(); ++i) {
+            if (default_map->find(i) == default_map->end()) {
+                hole_idx_arr.push_back(i);
+            }
+        }
+    }
+    return hole_idx_arr;
+}
 
 }  // namespace sdk
 }  // namespace openmldb

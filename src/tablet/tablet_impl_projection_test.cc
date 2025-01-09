@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 
 #include "base/file_util.h"
-#include "base/glog_wapper.h"
 #include "base/kv_iterator.h"
 #include "base/strings.h"
 #include "brpc/channel.h"
@@ -29,16 +28,11 @@
 #include "codec/schema_codec.h"
 #include "common/timer.h"
 #include "gtest/gtest.h"
-#include "log/log_reader.h"
-#include "log/log_writer.h"
 #include "proto/tablet.pb.h"
 #include "storage/mem_table.h"
-#include "storage/ticket.h"
 #include "tablet/tablet_impl.h"
-#include "vm/engine.h"
+#include "test/util.h"
 
-DECLARE_string(db_root_path);
-DECLARE_string(recycle_bin_root_path);
 DECLARE_string(zk_cluster);
 DECLARE_string(zk_root_path);
 DECLARE_int32(gc_interval);
@@ -59,6 +53,7 @@ class MockClosure : public ::google::protobuf::Closure {
 using ::openmldb::api::TableStatus;
 
 struct TestArgs {
+    openmldb::common::StorageMode storage_mode;
     Schema schema;
     common::ColumnKey ckey;
     std::string pk;
@@ -105,6 +100,31 @@ std::vector<TestArgs*> GenCommonCase() {
 
         uint32_t* idx = testargs->plist.Add();
         *idx = 1;
+        testargs->storage_mode = openmldb::common::kMemory;
+        args.push_back(testargs);
+    }
+    {
+        TestArgs* testargs = new TestArgs();
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col1", ::openmldb::type::kString);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col2", ::openmldb::type::kBigInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col3", ::openmldb::type::kInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col2", ::openmldb::type::kBigInt);
+        testargs->ckey.set_index_name("col1");
+        testargs->ckey.add_col_name("col1");
+        testargs->ckey.set_ts_name("col2");
+        auto ttl = testargs->ckey.mutable_ttl();
+        ttl->set_abs_ttl(0);
+        ttl->set_lat_ttl(0);
+        ttl->set_ttl_type(::openmldb::type::kAbsoluteTime);
+
+        testargs->pk = "hello";
+        testargs->ts = 1000l;
+        codec::RowCodec::EncodeRow({"hello", "1000", "32"}, testargs->schema, 1, testargs->input_row);
+        codec::RowCodec::EncodeRow({"1000"}, testargs->output_schema, 1, testargs->output_row);
+
+        uint32_t* idx = testargs->plist.Add();
+        *idx = 1;
+        testargs->storage_mode = openmldb::common::kHDD;
         args.push_back(testargs);
     }
     {
@@ -130,6 +150,33 @@ std::vector<TestArgs*> GenCommonCase() {
 
         uint32_t* idx = testargs->plist.Add();
         *idx = 3;
+        testargs->storage_mode = openmldb::common::kMemory;
+        args.push_back(testargs);
+    }
+    {
+        TestArgs* testargs = new TestArgs();
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col1", ::openmldb::type::kSmallInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col2", ::openmldb::type::kInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col3", ::openmldb::type::kBigInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col4", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col4", ::openmldb::type::kVarchar);
+
+        testargs->ckey.set_index_name("col4");
+        testargs->ckey.add_col_name("col4");
+        testargs->ckey.set_ts_name("col3");
+        auto ttl = testargs->ckey.mutable_ttl();
+        ttl->set_abs_ttl(0);
+        ttl->set_lat_ttl(0);
+        ttl->set_ttl_type(::openmldb::type::kAbsoluteTime);
+
+        testargs->pk = "hello";
+        testargs->ts = 1000l;
+        codec::RowCodec::EncodeRow({"1", "2", "1000", "hello"}, testargs->schema, 1, testargs->input_row);
+        codec::RowCodec::EncodeRow({"hello"}, testargs->output_schema, 1, testargs->output_row);
+
+        uint32_t* idx = testargs->plist.Add();
+        *idx = 3;
+        testargs->storage_mode = openmldb::common::kHDD;
         args.push_back(testargs);
     }
 
@@ -160,6 +207,37 @@ std::vector<TestArgs*> GenCommonCase() {
         *idx = 3;
         uint32_t* idx2 = testargs->plist.Add();
         *idx2 = 2;
+        testargs->storage_mode = openmldb::common::kMemory;
+        args.push_back(testargs);
+    }
+    {
+        TestArgs* testargs = new TestArgs();
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col1", ::openmldb::type::kSmallInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col2", ::openmldb::type::kInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col3", ::openmldb::type::kBigInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col4", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col4", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col3", ::openmldb::type::kBigInt);
+
+        testargs->ckey.set_index_name("col4");
+        testargs->ckey.add_col_name("col4");
+        testargs->ckey.set_ts_name("col3");
+        auto ttl = testargs->ckey.mutable_ttl();
+        ttl->set_abs_ttl(0);
+        ttl->set_lat_ttl(0);
+        ttl->set_ttl_type(::openmldb::type::kAbsoluteTime);
+
+        testargs->pk = "hello";
+        testargs->ts = 1000l;
+        codec::RowCodec::EncodeRow({"1", "2", "1000", "hello"}, testargs->schema, 1, testargs->input_row);
+        std::vector<std::string> values = {"hello", "1000"};
+        codec::RowCodec::EncodeRow(values, testargs->output_schema, 1, testargs->output_row);
+
+        uint32_t* idx = testargs->plist.Add();
+        *idx = 3;
+        uint32_t* idx2 = testargs->plist.Add();
+        *idx2 = 2;
+        testargs->storage_mode = openmldb::common::kHDD;
         args.push_back(testargs);
     }
     // add null
@@ -190,6 +268,37 @@ std::vector<TestArgs*> GenCommonCase() {
         *idx = 3;
         uint32_t* idx2 = testargs->plist.Add();
         *idx2 = 1;
+        testargs->storage_mode = openmldb::common::kMemory;
+        args.push_back(testargs);
+    }
+    {
+        TestArgs* testargs = new TestArgs();
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col1", ::openmldb::type::kSmallInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col2", ::openmldb::type::kInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col3", ::openmldb::type::kBigInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col4", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col4", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col2", ::openmldb::type::kInt);
+
+        testargs->ckey.set_index_name("col4");
+        testargs->ckey.add_col_name("col4");
+        testargs->ckey.set_ts_name("col3");
+        auto ttl = testargs->ckey.mutable_ttl();
+        ttl->set_abs_ttl(0);
+        ttl->set_lat_ttl(0);
+        ttl->set_ttl_type(::openmldb::type::kAbsoluteTime);
+
+        testargs->pk = "hello";
+        testargs->ts = 1000l;
+        codec::RowCodec::EncodeRow({"1", "null", "1000", "hello"}, testargs->schema, 1, testargs->input_row);
+        std::vector<std::string> values = {"hello", "null"};
+        codec::RowCodec::EncodeRow(values, testargs->output_schema, 1, testargs->output_row);
+
+        uint32_t* idx = testargs->plist.Add();
+        *idx = 3;
+        uint32_t* idx2 = testargs->plist.Add();
+        *idx2 = 1;
+        testargs->storage_mode = openmldb::common::kHDD;
         args.push_back(testargs);
     }
     // add null str
@@ -219,6 +328,36 @@ std::vector<TestArgs*> GenCommonCase() {
         *idx = 2;
         uint32_t* idx2 = testargs->plist.Add();
         *idx2 = 1;
+        testargs->storage_mode = openmldb::common::kMemory;
+        args.push_back(testargs);
+    }
+    {
+        TestArgs* testargs = new TestArgs();
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col1", ::openmldb::type::kSmallInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col2", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col3", ::openmldb::type::kBigInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->schema.Add(), "col4", ::openmldb::type::kVarchar);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col3", ::openmldb::type::kBigInt);
+        codec::SchemaCodec::SetColumnDesc(testargs->output_schema.Add(), "col2", ::openmldb::type::kVarchar);
+
+        testargs->ckey.set_index_name("col4");
+        testargs->ckey.add_col_name("col4");
+        testargs->ckey.set_ts_name("col3");
+        auto ttl = testargs->ckey.mutable_ttl();
+        ttl->set_abs_ttl(0);
+        ttl->set_lat_ttl(0);
+        ttl->set_ttl_type(::openmldb::type::kAbsoluteTime);
+        testargs->pk = "hello";
+        testargs->ts = 1000l;
+        codec::RowCodec::EncodeRow({"1", "null", "1000", "hello"}, testargs->schema, 1, testargs->input_row);
+        std::vector<std::string> values = {"1000", "null"};
+        codec::RowCodec::EncodeRow(values, testargs->output_schema, 1, testargs->output_row);
+
+        uint32_t* idx = testargs->plist.Add();
+        *idx = 2;
+        uint32_t* idx2 = testargs->plist.Add();
+        *idx2 = 1;
+        testargs->storage_mode = openmldb::common::kHDD;
         args.push_back(testargs);
     }
     return args;
@@ -336,7 +475,7 @@ TEST_P(TabletProjectTest, get_case) {
         table_meta->set_seg_cnt(8);
         table_meta->set_mode(::openmldb::api::TableMode::kTableLeader);
         table_meta->set_key_entry_max_height(8);
-        table_meta->set_format_version(1);
+        table_meta->set_storage_mode(args->storage_mode);
         Schema* schema = table_meta->mutable_column_desc();
         schema->CopyFrom(args->schema);
         ::openmldb::common::ColumnKey* ck = table_meta->add_column_key();
@@ -350,7 +489,6 @@ TEST_P(TabletProjectTest, get_case) {
         ::openmldb::api::PutRequest request;
         request.set_tid(tid);
         request.set_pid(0);
-        request.set_format_version(1);
         ::openmldb::api::Dimension* dim = request.add_dimensions();
         dim->set_idx(0);
         std::string key = args->pk;
@@ -398,7 +536,7 @@ TEST_P(TabletProjectTest, sql_case) {
         table_meta->set_seg_cnt(8);
         table_meta->set_mode(::openmldb::api::TableMode::kTableLeader);
         table_meta->set_key_entry_max_height(8);
-        table_meta->set_format_version(1);
+        table_meta->set_storage_mode(args->storage_mode);
         Schema* schema = table_meta->mutable_column_desc();
         schema->CopyFrom(args->schema);
         ::openmldb::common::ColumnKey* ck = table_meta->add_column_key();
@@ -412,7 +550,6 @@ TEST_P(TabletProjectTest, sql_case) {
         ::openmldb::api::PutRequest request;
         request.set_tid(tid);
         request.set_pid(0);
-        request.set_format_version(1);
         ::openmldb::api::Dimension* dim = request.add_dimensions();
         dim->set_idx(0);
         std::string key = args->pk;
@@ -453,7 +590,7 @@ TEST_P(TabletProjectTest, scan_case) {
         table_meta->set_seg_cnt(8);
         table_meta->set_mode(::openmldb::api::TableMode::kTableLeader);
         table_meta->set_key_entry_max_height(8);
-        table_meta->set_format_version(1);
+        table_meta->set_storage_mode(args->storage_mode);
         Schema* schema = table_meta->mutable_column_desc();
         schema->CopyFrom(args->schema);
         ::openmldb::common::ColumnKey* ck = table_meta->add_column_key();
@@ -467,7 +604,6 @@ TEST_P(TabletProjectTest, scan_case) {
         ::openmldb::api::PutRequest request;
         request.set_tid(tid);
         request.set_pid(0);
-        request.set_format_version(1);
         ::openmldb::api::Dimension* dim = request.add_dimensions();
         dim->set_idx(0);
         std::string key = args->pk;
@@ -487,15 +623,15 @@ TEST_P(TabletProjectTest, scan_case) {
         sr.set_st(args->ts);
         sr.set_et(0);
         sr.mutable_projection()->CopyFrom(args->plist);
-        ::openmldb::api::ScanResponse srp;
-        tablet_.Scan(NULL, &sr, &srp, &closure);
-        ASSERT_EQ(0, srp.code());
-        ASSERT_EQ(1, (int64_t)srp.count());
-        ::openmldb::base::KvIterator* kv_it = new ::openmldb::base::KvIterator(&srp);
-        ASSERT_TRUE(kv_it->Valid());
-        ASSERT_EQ(kv_it->GetValue().size(), args->output_row.size());
+        auto srp = std::make_shared<::openmldb::api::ScanResponse>();
+        tablet_.Scan(NULL, &sr, srp.get(), &closure);
+        ASSERT_EQ(0, srp->code());
+        ASSERT_EQ(1, (int64_t)srp->count());
+        ::openmldb::base::ScanKvIterator kv_it(args->pk, srp);
+        ASSERT_TRUE(kv_it.Valid());
+        ASSERT_EQ(kv_it.GetValue().size(), args->output_row.size());
         codec::RowView left(args->output_schema);
-        left.Reset(reinterpret_cast<const int8_t*>(kv_it->GetValue().data()), kv_it->GetValue().size());
+        left.Reset(reinterpret_cast<const int8_t*>(kv_it.GetValue().data()), kv_it.GetValue().size());
         codec::RowView right(args->output_schema);
         right.Reset(reinterpret_cast<int8_t*>(args->output_row.data()), args->output_row.size());
         CompareRow(&left, &right, args->output_schema);
@@ -509,11 +645,8 @@ INSTANTIATE_TEST_SUITE_P(TabletProjectPrefix, TabletProjectTest, testing::Values
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    ::openmldb::test::InitRandomDiskFlags("tablet_impl_projection_test");
     srand(time(NULL));
-    std::string k1 = ::openmldb::tablet::GenRand();
-    std::string k2 = ::openmldb::tablet::GenRand();
-    FLAGS_db_root_path = "/tmp/db" + k1 + ",/tmp/db" + k2;
-    FLAGS_recycle_bin_root_path = "/tmp/recycle" + k1 + ",/tmp/recycle" + k2;
     ::hybridse::vm::Engine::InitializeGlobalLLVM();
     return RUN_ALL_TESTS();
 }

@@ -31,9 +31,9 @@ foreach(SRC_FILE ${BENCHMARK_FILES})
     endif()
 endforeach()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(BENCHMARK_LIBS ${ABSL_LIBS} ${yaml_libs} ${g_libs} boost_filesystem ${VM_LIBS} ${LLVM_LIBS} ${BRPC_LIBS} tcmalloc ${OS_LIB} benchmark gtest)
+    set(BENCHMARK_LIBS ${ABSL_LIBS} ${yaml_libs} ${g_libs} ${Boost_filesystem_LIBRARY} ${VM_LIBS} ${LLVM_LIBS} ${COMMON_LIBS} tcmalloc ${OS_LIB} benchmark ${GTEST_LIBRARIES})
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(BENCHMARK_LIBS ${ABSL_LIBS} ${yaml_libs} ${g_libs} boost_filesystem ${VM_LIBS} ${LLVM_LIBS} ${BRPC_LIBS} ${OS_LIB} benchmark gtest)
+    set(BENCHMARK_LIBS ${ABSL_LIBS} ${yaml_libs} ${g_libs} ${Boost_filesystem_LIBRARY} ${VM_LIBS} ${LLVM_LIBS} ${COMMON_LIBS} ${OS_LIB} benchmark ${GTEST_LIBRARIES})
 endif ()
 # bm lib
 add_library(hybridse_bm_lib STATIC ${BENCHMARK_LIB_FILE_LIST})
@@ -65,12 +65,12 @@ if (TESTING_ENABLE AND HYBRIDSE_TESTING_ENABLE)
         add_executable(${TEST_TARGET_NAME} ${TEST_SCRIPT})
 
         add_test(${TEST_TARGET_NAME}
-            ${TEST_TARGET_NAME}
-            --gtest_output=xml:${CMAKE_BINARY_DIR}/${TEST_TARGET_NAME}.xml)
+            ${CMAKE_CURRENT_BINARY_DIR}/${TEST_TARGET_DIR}/${TEST_TARGET_NAME}
+            --gtest_output=xml:${CMAKE_CURRENT_BINARY_DIR}/${TEST_TARGET_DIR}/${TEST_TARGET_NAME}.xml)
 
         target_link_libraries(${TEST_TARGET_NAME}
             hybridse_bm_lib hybridse_sdk hybridse_flags
-            gtest benchmark ${yaml_libs} ${BRPC_LIBS} ${OS_LIBS} ${g_libs})
+            ${GTEST_LIBRARIES} benchmark ${yaml_libs} ${COMMON_LIBS} ${OS_LIB} ${g_libs})
         list(APPEND test_list ${TEST_TARGET_NAME})
     endforeach()
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

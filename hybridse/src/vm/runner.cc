@@ -15,16 +15,25 @@
  */
 
 #include "vm/runner.h"
+
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
+
+#include "absl/status/status.h"
+#include "absl/strings/substitute.h"
 #include "base/texttable.h"
-#include "udf/udf.h"
+#include "gflags/gflags.h"
+#include "node/node_enum.h"
+#include "vm/catalog.h"
 #include "vm/catalog_wrapper.h"
 #include "vm/core_api.h"
+#include "vm/internal/eval.h"
 #include "vm/jit_runtime.h"
 #include "vm/mem_catalog.h"
+#include "vm/runner_ctx.h"
+
+DECLARE_bool(enable_spark_unsaferow_format);
 
 namespace hybridse {
 namespace vm {
@@ -32,761 +41,55 @@ namespace vm {
 #define MAX_DEBUG_LINES_CNT 20
 #define MAX_DEBUG_COLUMN_MAX 20
 
-// Build Runner for each physical node
-// return cluster task of given runner
-//
-// DataRunner(kProviderTypePartition) --> cluster task
-// RequestRunner --> local task
-// DataRunner(kProviderTypeTable) --> LocalTask, Unsupport in distribute
-// database
-//
-// SimpleProjectRunner --> inherit task
-// TableProjectRunner --> inherit task
-// WindowAggRunner --> LocalTask , Unsupport in distribute database
-// GroupAggRunner --> LocalTask, Unsupport in distribute database
-//
-// RowProjectRunner --> inherit task
-// ConstProjectRunner --> local task
-//
-// RequestUnionRunner
-//      --> complete route_info of right cluster task
-//      --> build proxy runner if need
-// RequestJoinRunner
-//      --> complete route_info of right cluster task
-//      --> build proxy runner if need
-// kPhysicalOpJoin
-//      --> kJoinTypeLast->RequestJoinRunner
-//              --> complete route_info of right cluster task
-//              --> build proxy runner if need
-//      --> kJoinTypeConcat
-//              --> build proxy runner if need
-// kPhysicalOpPostRequestUnion
-//      --> build proxy runner if need
-// GroupRunner --> LocalTask, Unsupport in distribute database
-// kPhysicalOpFilter
-// kPhysicalOpLimit
-// kPhysicalOpRename
-ClusterTask RunnerBuilder::Build(PhysicalOpNode* node, Status& status) {
-    auto fail = InvalidTask();
-    if (nullptr == node) {
-        status.msg = "fail to build runner : physical node is null";
-        status.code = common::kExecutionPlanError;
-        LOG(WARNING) << status;
-        return fail;
+static absl::flat_hash_map<RunnerType, absl::string_view> CreateRunnerTypeToNamesMap() {
+    absl::flat_hash_map<RunnerType, absl::string_view> map = {
+        {kRunnerData, "DATA"},
+        {kRunnerRequest, "REQUEST"},
+        {kRunnerGroup, "GROUP"},
+        {kRunnerGroupAndSort, "GROUP_AND_SORT"},
+        {kRunnerFilter, "FILTER"},
+        {kRunnerConstProject, "CONST_PROJECT"},
+        {kRunnerTableProject, "TABLE_PROJECT"},
+        {kRunnerRowProject, "ROW_PROJECT"},
+        {kRunnerSimpleProject, "SIMPLE_PROJECT"},
+        {kRunnerSelectSlice, "SELECT_SLICE"},
+        {kRunnerGroupAgg, "GROUP_AGG_PROJECT"},
+        {kRunnerAgg, "AGG_PROJECT"},
+        {kRunnerReduce, "REDUCE_PROJECT"},
+        {kRunnerWindowAgg, "WINDOW_AGG_PROJECT"},
+        {kRunnerRequestUnion, "REQUEST_UNION"},
+        {kRunnerRequestAggUnion, "REQUEST_AGG_UNION"},
+        {kRunnerPostRequestUnion, "POST_REQUEST_UNION"},
+        {kRunnerIndexSeek, "INDEX_SEEK"},
+        {kRunnerJoin, "JOIN"},
+        {kRunnerConcat, "CONCAT"},
+        {kRunnerRequestJoin, "REQUEST_JOIN"},
+        {kRunnerLimit, "LIMIT"},
+        {kRunnerRequestRunProxy, "REQUEST_RUN_PROXY"},
+        {kRunnerBatchRequestRunProxy, "BATCH_REQUEST_RUN_PROXY"},
+        {kRunnerOrder, "ORDRE"},
+        {kRunnerSetOperation, "SET_OPERATION"},
+        {kRunnerUnknow, "UNKOWN_RUNNER"},
+    };
+    for (auto kind = 0; kind < RunnerType::kRunnerUnknow; ++kind) {
+        DCHECK(map.find(static_cast<RunnerType>(kind)) != map.end())
+            << "name of " << kind << " not exist";
     }
-    auto iter = task_map_.find(node);
-    if (iter != task_map_.cend()) {
-        iter->second.GetRoot()->EnableCache();
-        return iter->second;
-    }
-    switch (node->GetOpType()) {
-        case kPhysicalOpDataProvider: {
-            auto op = dynamic_cast<const PhysicalDataProviderNode*>(node);
-            switch (op->provider_type_) {
-                case kProviderTypeTable: {
-                    auto provider =
-                        dynamic_cast<const PhysicalTableProviderNode*>(node);
-                    DataRunner* runner = nullptr;
-                    CreateRunner<DataRunner>(&runner, id_++,
-                                             node->schemas_ctx(),
-                                             provider->table_handler_);
-                    return RegisterTask(node, CommonTask(runner));
-                }
-                case kProviderTypePartition: {
-                    auto provider =
-                        dynamic_cast<const PhysicalPartitionProviderNode*>(
-                            node);
-                    DataRunner* runner = nullptr;
-                    CreateRunner<DataRunner>(
-                        &runner, id_++, node->schemas_ctx(),
-                        provider->table_handler_->GetPartition(
-                            provider->index_name_));
-                    if (support_cluster_optimized_) {
-                        return RegisterTask(
-                            node, UnCompletedClusterTask(
-                                      runner, provider->table_handler_,
-                                      provider->index_name_));
-                    } else {
-                        return RegisterTask(node, CommonTask(runner));
-                    }
-                }
-                case kProviderTypeRequest: {
-                    RequestRunner* runner = nullptr;
-                    CreateRunner<RequestRunner>(&runner, id_++,
-                                                node->schemas_ctx());
-                    return RegisterTask(node, BuildRequestTask(runner));
-                }
-                default: {
-                    status.msg = "fail to support data provider type " +
-                                 DataProviderTypeName(op->provider_type_);
-                    status.code = common::kExecutionPlanError;
-                    LOG(WARNING) << status;
-                    return RegisterTask(node, fail);
-                }
-            }
-        }
-        case kPhysicalOpSimpleProject: {
-            auto cluster_task =  // NOLINT
-                Build(node->producers().at(0), status);
-            if (!cluster_task.IsValid()) {
-                status.msg = "fail to build input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto op = dynamic_cast<const PhysicalSimpleProjectNode*>(node);
-            int select_slice = op->GetSelectSourceIndex();
-            if (select_slice >= 0) {
-                SelectSliceRunner* runner = nullptr;
-                CreateRunner<SelectSliceRunner>(
-                    &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                    select_slice);
-                return RegisterTask(node,
-                                    UnaryInheritTask(cluster_task, runner));
-            } else {
-                SimpleProjectRunner* runner = nullptr;
-                CreateRunner<SimpleProjectRunner>(
-                    &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                    op->project().fn_info());
-                return RegisterTask(node,
-                                    UnaryInheritTask(cluster_task, runner));
-            }
-        }
-        case kPhysicalOpConstProject: {
-            auto op = dynamic_cast<const PhysicalConstProjectNode*>(node);
-            ConstProjectRunner* runner = nullptr;
-            CreateRunner<ConstProjectRunner>(
-                &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                op->project().fn_info());
-            return RegisterTask(node, CommonTask(runner));
-        }
-        case kPhysicalOpProject: {
-            auto cluster_task =  // NOLINT
-                Build(node->producers().at(0), status);
-            if (!cluster_task.IsValid()) {
-                status.msg = "fail to build runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto input = cluster_task.GetRoot();
-            auto op = dynamic_cast<const PhysicalProjectNode*>(node);
-            switch (op->project_type_) {
-                case kTableProject: {
-                    if (support_cluster_optimized_) {
-                        // Non-support table join under distribution env
-                        status.msg = "fail to build cluster with table project";
-                        status.code = common::kExecutionPlanError;
-                        LOG(WARNING) << status;
-                        return fail;
-                    }
-                    TableProjectRunner* runner = nullptr;
-                    CreateRunner<TableProjectRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(), op->project().fn_info());
-                    return RegisterTask(node,
-                                        UnaryInheritTask(cluster_task, runner));
-                }
-                case kAggregation: {
-                    AggRunner* runner = nullptr;
-                    CreateRunner<AggRunner>(&runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                                            dynamic_cast<const PhysicalAggrerationNode*>(node)->having_condition_,
-                                            op->project().fn_info());
-                    return RegisterTask(node,
-                                        UnaryInheritTask(cluster_task, runner));
-                }
-                case kGroupAggregation: {
-                    if (support_cluster_optimized_) {
-                        // Non-support group aggregation under distribution env
-                        status.msg =
-                            "fail to build cluster with group agg project";
-                        status.code = common::kExecutionPlanError;
-                        LOG(WARNING) << status;
-                        return fail;
-                    }
-                    auto op =
-                        dynamic_cast<const PhysicalGroupAggrerationNode*>(node);
-                    GroupAggRunner* runner = nullptr;
-                    CreateRunner<GroupAggRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                        op->group_, op->having_condition_, op->project().fn_info());
-                    return RegisterTask(node,
-                                        UnaryInheritTask(cluster_task, runner));
-                }
-                case kWindowAggregation: {
-                    if (support_cluster_optimized_) {
-                        // Non-support table window aggregation join under distribution env
-                        status.msg =
-                            "fail to build cluster with window agg project";
-                        status.code = common::kExecutionPlanError;
-                        LOG(WARNING) << status;
-                        return fail;
-                    }
-                    auto op =
-                        dynamic_cast<const PhysicalWindowAggrerationNode*>(
-                            node);
-                    WindowAggRunner* runner = nullptr;
-                    CreateRunner<WindowAggRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                        op->window_, op->project().fn_info(),
-                        op->instance_not_in_window(),
-                        op->exclude_current_time(), op->need_append_input());
-                    size_t input_slices =
-                        input->output_schemas()->GetSchemaSourceSize();
-                    if (!op->window_unions_.Empty()) {
-                        for (auto window_union :
-                             op->window_unions_.window_unions_) {
-                            auto union_task = Build(window_union.first, status);
-                            auto union_table = union_task.GetRoot();
-                            if (nullptr == union_table) {
-                                return RegisterTask(node, fail);
-                            }
-                            runner->AddWindowUnion(window_union.second,
-                                                   union_table);
-                        }
-                    }
-                    if (!op->window_joins_.Empty()) {
-                        for (auto& window_join :
-                             op->window_joins_.window_joins_) {
-                            auto join_task =  // NOLINT
-                                Build(window_join.first, status);
-                            auto join_right_runner = join_task.GetRoot();
-                            if (nullptr == join_right_runner) {
-                                return RegisterTask(node, fail);
-                            }
-                            runner->AddWindowJoin(window_join.second,
-                                                  input_slices,
-                                                  join_right_runner);
-                        }
-                    }
-                    return RegisterTask(node,
-                                        UnaryInheritTask(cluster_task, runner));
-                }
-                case kRowProject: {
-                    RowProjectRunner* runner = nullptr;
-                    CreateRunner<RowProjectRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(), op->project().fn_info());
-                    return RegisterTask(node,
-                                        UnaryInheritTask(cluster_task, runner));
-                }
-                default: {
-                    status.msg = "fail to support project type " +
-                                 ProjectTypeName(op->project_type_);
-                    status.code = common::kExecutionPlanError;
-                    LOG(WARNING) << status;
-                    return RegisterTask(node, fail);
-                }
-            }
-        }
-        case kPhysicalOpRequestUnion: {
-            auto left_task = Build(node->producers().at(0), status);
-            if (!left_task.IsValid()) {
-                status.msg = "fail to build left input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto right_task = Build(node->producers().at(1), status);
-            auto right = right_task.GetRoot();
-            if (!right_task.IsValid()) {
-                status.msg = "fail to build right input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto op = dynamic_cast<const PhysicalRequestUnionNode*>(node);
-            RequestUnionRunner* runner = nullptr;
-            CreateRunner<RequestUnionRunner>(
-                &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                op->window().range_, op->exclude_current_time(),
-                op->output_request_row());
-            Key index_key;
-            if (!op->instance_not_in_window()) {
-                runner->AddWindowUnion(op->window_, right);
-                index_key = op->window_.index_key_;
-            }
-            if (!op->window_unions_.Empty()) {
-                for (auto window_union : op->window_unions_.window_unions_) {
-                    auto union_task = Build(window_union.first, status);
-                    auto union_table = union_task.GetRoot();
-                    if (nullptr == union_table) {
-                        return RegisterTask(node, fail);
-                    }
-                    runner->AddWindowUnion(window_union.second, union_table);
-                    if (!index_key.ValidKey()) {
-                        index_key = window_union.second.index_key_;
-                        right_task = union_task;
-                        right_task.SetRoot(right);
-                    } else if (support_cluster_optimized_) {
-                        LOG(WARNING) << "Fail to build RequestUnionRunner with "
-                                        "multi union table in cluster mode";
-                        return ClusterTask();
-                    }
-                }
-            }
-            return RegisterTask(
-                node, BinaryInherit(left_task, right_task, runner, index_key,
-                                    kRightBias));
-        }
-        case kPhysicalOpRequestJoin: {
-            auto left_task =  // NOLINT
-                Build(node->producers().at(0), status);
-            if (!left_task.IsValid()) {
-                status.msg = "fail to build left input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto left = left_task.GetRoot();
-            auto right_task =  // NOLINT
-                Build(node->producers().at(1), status);
-            if (!right_task.IsValid()) {
-                status.msg = "fail to build right input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto right = right_task.GetRoot();
-            auto op = dynamic_cast<const PhysicalRequestJoinNode*>(node);
-            switch (op->join().join_type()) {
-                case node::kJoinTypeLast: {
-                    RequestLastJoinRunner* runner = nullptr;
-                    CreateRunner<RequestLastJoinRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt(),
-                        op->join_,
-                        left->output_schemas()->GetSchemaSourceSize(),
-                        right->output_schemas()->GetSchemaSourceSize(),
-                        op->output_right_only());
-
-                    return RegisterTask(
-                        node, BinaryInherit(left_task, right_task, runner,
-                                            op->join().index_key(), kLeftBias));
-                }
-                case node::kJoinTypeConcat: {
-                    ConcatRunner* runner = nullptr;
-                    CreateRunner<ConcatRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt());
-                    return RegisterTask(
-                        node, BinaryInherit(left_task, right_task, runner,
-                                            Key(), kNoBias));
-                }
-                default: {
-                    status.code = common::kExecutionPlanError;
-                    status.msg = "can't handle join type " +
-                                 node::JoinTypeName(op->join().join_type());
-                    LOG(WARNING) << status;
-                    return RegisterTask(node, fail);
-                }
-            }
-        }
-        case kPhysicalOpJoin: {
-            auto left_task = Build(node->producers().at(0), status);
-            if (!left_task.IsValid()) {
-                status.msg = "fail to build left input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto left = left_task.GetRoot();
-            auto right_task = Build(node->producers().at(1), status);
-            if (!right_task.IsValid()) {
-                status.msg = "fail to build right input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto right = right_task.GetRoot();
-            auto op = dynamic_cast<const PhysicalJoinNode*>(node);
-            switch (op->join().join_type()) {
-                case node::kJoinTypeLast: {
-                    // TableLastJoin convert to
-                    // Batch Request RequestLastJoin
-                    if (support_cluster_optimized_) {
-                        RequestLastJoinRunner* runner = nullptr;
-                        CreateRunner<RequestLastJoinRunner>(
-                            &runner, id_++, node->schemas_ctx(),
-                            op->GetLimitCnt(), op->join_,
-                            left->output_schemas()->GetSchemaSourceSize(),
-                            right->output_schemas()->GetSchemaSourceSize(),
-                            op->output_right_only_);
-                        return RegisterTask(
-                            node,
-                            BinaryInherit(left_task, right_task, runner,
-                                          op->join().index_key(), kLeftBias));
-                    } else {
-                        LastJoinRunner* runner = nullptr;
-                        CreateRunner<LastJoinRunner>(
-                            &runner, id_++, node->schemas_ctx(),
-                            op->GetLimitCnt(), op->join_,
-                            left->output_schemas()->GetSchemaSourceSize(),
-                            right->output_schemas()->GetSchemaSourceSize());
-                        return RegisterTask(
-                            node, BinaryInherit(left_task, right_task, runner,
-                                                Key(), kLeftBias));
-                    }
-                }
-                case node::kJoinTypeConcat: {
-                    ConcatRunner* runner = nullptr;
-                    CreateRunner<ConcatRunner>(
-                        &runner, id_++, node->schemas_ctx(), op->GetLimitCnt());
-                    return RegisterTask(
-                        node, BinaryInherit(left_task, right_task, runner,
-                                            op->join().index_key(), kNoBias));
-                }
-                default: {
-                    status.code = common::kExecutionPlanError;
-                    status.msg = "can't handle join type " +
-                                 node::JoinTypeName(op->join().join_type());
-                    LOG(WARNING) << status;
-                    return RegisterTask(node, fail);
-                }
-            }
-        }
-        case kPhysicalOpGroupBy: {
-            if (support_cluster_optimized_) {
-                // Non-support group by under distribution env
-                status.msg = "fail to build cluster with group by node";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto cluster_task = Build(node->producers().at(0), status);
-            if (!cluster_task.IsValid()) {
-                status.msg = "fail to build input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto op = dynamic_cast<const PhysicalGroupNode*>(node);
-            GroupRunner* runner = nullptr;
-            CreateRunner<GroupRunner>(&runner, id_++, node->schemas_ctx(),
-                                      op->GetLimitCnt(), op->group());
-            return RegisterTask(node, UnaryInheritTask(cluster_task, runner));
-        }
-        case kPhysicalOpFilter: {
-            auto cluster_task =  // NOLINT
-                Build(node->producers().at(0), status);
-            if (!cluster_task.IsValid()) {
-                status.msg = "fail to build input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto op = dynamic_cast<const PhysicalFilterNode*>(node);
-            FilterRunner* runner = nullptr;
-            CreateRunner<FilterRunner>(&runner, id_++, node->schemas_ctx(),
-                                       op->GetLimitCnt(), op->filter_);
-            return RegisterTask(node, UnaryInheritTask(cluster_task, runner));
-        }
-        case kPhysicalOpLimit: {
-            auto cluster_task =  // NOLINT
-                Build(node->producers().at(0), status);
-            if (!cluster_task.IsValid()) {
-                status.msg = "fail to build input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto op = dynamic_cast<const PhysicalLimitNode*>(node);
-            if (op->GetLimitCnt() == 0 || op->GetLimitOptimized()) {
-                return RegisterTask(node, cluster_task);
-            }
-            LimitRunner* runner = nullptr;
-            CreateRunner<LimitRunner>(&runner, id_++, node->schemas_ctx(),
-                                      op->GetLimitCnt());
-            return RegisterTask(node, UnaryInheritTask(cluster_task, runner));
-        }
-        case kPhysicalOpRename: {
-            return Build(node->producers().at(0), status);
-        }
-        case kPhysicalOpPostRequestUnion: {
-            auto left_task = Build(node->producers().at(0), status);
-            if (!left_task.IsValid()) {
-                status.msg = "fail to build left input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto right_task = Build(node->producers().at(1), status);
-            if (!right_task.IsValid()) {
-                status.msg = "fail to build right input runner";
-                status.code = common::kExecutionPlanError;
-                LOG(WARNING) << status;
-                return fail;
-            }
-            auto union_op = dynamic_cast<PhysicalPostRequestUnionNode*>(node);
-            PostRequestUnionRunner* runner = nullptr;
-            CreateRunner<PostRequestUnionRunner>(
-                &runner, id_++, node->schemas_ctx(), union_op->request_ts());
-            return RegisterTask(node, BinaryInherit(left_task, right_task,
-                                                    runner, Key(), kRightBias));
-        }
-        default: {
-            status.code = common::kExecutionPlanError;
-            status.msg = "Non-support node " +
-                         PhysicalOpTypeName(node->GetOpType()) + " for OpenMLDB Online execute mode";
-            LOG(WARNING) << status;
-            return RegisterTask(node, fail);
-        }
-    }
+    return map;
 }
 
-ClusterTask RunnerBuilder::BinaryInherit(const ClusterTask& left,
-                                         const ClusterTask& right,
-                                         Runner* runner, const Key& index_key,
-                                         const TaskBiasType bias) {
-    if (support_cluster_optimized_) {
-        return BuildClusterTaskForBinaryRunner(left, right, runner, index_key,
-                                               bias);
-    } else {
-        return BuildLocalTaskForBinaryRunner(left, right, runner);
-    }
+static const auto& GetRunnerTypeToNamesMap() {
+    static const auto &map = *new auto(CreateRunnerTypeToNamesMap());
+    return map;
 }
-ClusterTask RunnerBuilder::BuildLocalTaskForBinaryRunner(
-    const ClusterTask& left, const ClusterTask& right, Runner* runner) {
-    if (left.IsClusterTask() || right.IsClusterTask()) {
-        LOG(WARNING) << "fail to build local task for binary runner";
-        return ClusterTask();
-    }
-    runner->AddProducer(left.GetRoot());
-    runner->AddProducer(right.GetRoot());
-    return ClusterTask(runner);
-}
-ClusterTask RunnerBuilder::BuildClusterTaskForBinaryRunner(
-    const ClusterTask& left, const ClusterTask& right, Runner* runner,
-    const Key& index_key, const TaskBiasType bias) {
-    if (nullptr == runner) {
-        LOG(WARNING) << "Fail to build cluster task for null runner";
-        return ClusterTask();
-    }
-    ClusterTask new_left = left;
-    ClusterTask new_right = right;
 
-    Runner* right_runner = new_right.GetRoot();
-    Runner* left_runner = new_left.GetRoot();
-    // if index key is valid, try to complete route info of right cluster
-    // task
-    if (index_key.ValidKey()) {
-        if (!right.IsClusterTask()) {
-            LOG(WARNING) << "Fail to buidl cluster task for "
-                         << "[" << runner->id_ << "]"
-                         << RunnerTypeName(runner->type_)
-                         << ": can't handler local task with index key";
-            return ClusterTask();
-        }
-        if (right.IsCompletedClusterTask()) {
-            LOG(WARNING) << "Fail to complete cluster task for "
-                         << "[" << runner->id_ << "]"
-                         << RunnerTypeName(runner->type_)
-                         << ": task is completed already";
-            return ClusterTask();
-        }
-        RequestRunner* request_runner = nullptr;
-        CreateRunner(&request_runner, id_++, left_runner->output_schemas());
-        runner->AddProducer(request_runner);
-        runner->AddProducer(right_runner);
-        // build complete cluster task
-        const RouteInfo& right_route_info = new_right.GetRouteInfo();
-        ClusterTask cluster_task(
-            runner, std::vector<Runner*>({runner}),
-            RouteInfo(right_route_info.index_, index_key,
-                      std::make_shared<ClusterTask>(new_left),
-                      right_route_info.table_handler_));
-        // TODO(chenjing): opt
-        if (new_left.IsCompletedClusterTask()) {
-            return BuildProxyRunnerForClusterTask(cluster_task);
-        } else {
-            return cluster_task;
-        }
+std::string RunnerTypeName(RunnerType type) {
+    auto& map = GetRunnerTypeToNamesMap();
+    auto it = map.find(type);
+    if (it != map.end()) {
+        return std::string(it->second);
     }
-
-    // Concat
-    //      Agg1(Proxy(RequestUnion(Request, DATA))
-    //      Agg2(Proxy(RequestUnion(Request, DATA))
-    // -->
-    // Proxy(Concat
-    //          Agg1(RequestUnion(Request,DATA)
-    //          Agg2(RequestUnion(Request,DATA)
-    //      )
-
-    // if left and right is completed cluster task
-    while (new_left.IsCompletedClusterTask() &&
-           new_right.IsCompletedClusterTask()) {
-        // merge left and right task if tasks can be merged
-        if (ClusterTask::TaskCanBeMerge(new_left, new_right)) {
-            ClusterTask task =
-                ClusterTask::TaskMerge(runner, new_left, new_right);
-            runner->AddProducer(new_left.GetRoot());
-            runner->AddProducer(new_right.GetRoot());
-            return task;
-        }
-        switch (bias) {
-            case kNoBias: {
-                // Add build left proxy task into cluster job,
-                // and update new_left
-                new_left = BuildProxyRunnerForClusterTask(new_left);
-                new_right = BuildProxyRunnerForClusterTask(new_right);
-                break;
-            }
-            case kLeftBias: {
-                // build proxy runner for right task
-                new_right = BuildProxyRunnerForClusterTask(new_right);
-                break;
-            }
-            case kRightBias: {
-                // build proxy runner for right task
-                new_left = BuildProxyRunnerForClusterTask(new_left);
-                break;
-            }
-        }
-    }
-    if (new_left.IsUnCompletedClusterTask() ||
-        new_right.IsUnCompletedClusterTask()) {
-        LOG(WARNING) << "Fail to build cluster task, can't handler "
-                        "uncompleted cluster task";
-        return ClusterTask();
-    }
-
-    // prepare left and right for runner
-
-    // left local task + right cluster task
-    if (new_right.IsCompletedClusterTask()) {
-        switch (bias) {
-            case kNoBias:
-            case kLeftBias: {
-                new_right = BuildProxyRunnerForClusterTask(new_right);
-                runner->AddProducer(new_left.GetRoot());
-                runner->AddProducer(new_right.GetRoot());
-                return ClusterTask::TaskMergeToLeft(runner, new_left,
-                                                    new_right);
-            }
-            case kRightBias: {
-                auto new_left_root_input =
-                    ClusterTask::GetRequestInput(new_left);
-                auto new_right_root_input =
-                    ClusterTask::GetRequestInput(new_right);
-                // task can be merge simply when their inputs are the same
-                if (new_right_root_input == new_left_root_input) {
-                    runner->AddProducer(new_left.GetRoot());
-                    runner->AddProducer(new_right.GetRoot());
-                    return ClusterTask::TaskMergeToRight(runner, new_left,
-                                                         new_right);
-                } else if (new_left_root_input == nullptr) {
-                    // reset replace inputs as request runner
-                    new_right.ResetInputs(nullptr);
-                    runner->AddProducer(new_left.GetRoot());
-                    runner->AddProducer(new_right.GetRoot());
-                    return ClusterTask::TaskMergeToRight(runner, new_left,
-                                                         new_right);
-                } else {
-                    LOG(WARNING) << "fail to merge local left task and cluster "
-                                    "right task";
-                    return ClusterTask();
-                }
-            }
-            default:
-                return ClusterTask();
-        }
-    } else if (new_left.IsCompletedClusterTask()) {
-        switch (bias) {
-            case kNoBias:
-            case kRightBias: {
-                new_left = BuildProxyRunnerForClusterTask(new_left);
-                runner->AddProducer(new_left.GetRoot());
-                runner->AddProducer(new_right.GetRoot());
-                return ClusterTask::TaskMergeToRight(runner, new_left,
-                                                     new_right);
-            }
-            case kLeftBias: {
-                auto new_left_root_input =
-                    ClusterTask::GetRequestInput(new_right);
-                auto new_right_root_input =
-                    ClusterTask::GetRequestInput(new_right);
-                // task can be merge simply
-                if (new_right_root_input == new_left_root_input) {
-                    runner->AddProducer(new_left.GetRoot());
-                    runner->AddProducer(new_right.GetRoot());
-                    return ClusterTask::TaskMergeToLeft(runner, new_left,
-                                                        new_right);
-                } else if (new_right_root_input == nullptr) {
-                    // reset replace inputs as request runner
-                    new_left.ResetInputs(nullptr);
-                    runner->AddProducer(new_left.GetRoot());
-                    runner->AddProducer(new_right.GetRoot());
-                    return ClusterTask::TaskMergeToLeft(runner, new_left,
-                                                        new_right);
-                } else {
-                    LOG(WARNING) << "fail to merge cluster left task and local "
-                                    "right task";
-                    return ClusterTask();
-                }
-            }
-            default:
-                return ClusterTask();
-        }
-    } else {
-        runner->AddProducer(new_left.GetRoot());
-        runner->AddProducer(new_right.GetRoot());
-        return ClusterTask::TaskMergeToLeft(runner, new_left, new_right);
-    }
-}
-ClusterTask RunnerBuilder::BuildProxyRunnerForClusterTask(
-    const ClusterTask& task) {
-    if (!task.IsCompletedClusterTask()) {
-        LOG(WARNING)
-            << "Fail to build proxy runner, cluster task is uncompleted";
-        return ClusterTask();
-    }
-    // return cached proxy runner
-    Runner* proxy_runner = nullptr;
-    auto find_iter = proxy_runner_map_.find(task.GetRoot());
-    if (find_iter != proxy_runner_map_.cend()) {
-        proxy_runner = find_iter->second;
-        proxy_runner->EnableCache();
-    } else {
-        ProxyRequestRunner* new_proxy_runner = nullptr;
-        uint32_t remote_task_id = cluster_job_.AddTask(task);
-        CreateRunner<ProxyRequestRunner>(
-            &new_proxy_runner, id_++, remote_task_id, task.GetIndexKeyInput(),
-            task.GetRoot()->output_schemas());
-        if (nullptr != task.GetIndexKeyInput()) {
-            task.GetIndexKeyInput()->EnableCache();
-        }
-        if (task.GetRoot()->need_batch_cache()) {
-            new_proxy_runner->EnableBatchCache();
-        }
-        proxy_runner_map_.insert(
-            std::make_pair(task.GetRoot(), new_proxy_runner));
-        proxy_runner = new_proxy_runner;
-    }
-
-    if (task.GetInput()) {
-        return UnaryInheritTask(*task.GetInput(), proxy_runner);
-    } else {
-        return UnaryInheritTask(*request_task_, proxy_runner);
-    }
-    LOG(WARNING) << "Fail to build proxy runner for cluster job";
-    return ClusterTask();
-}
-ClusterTask RunnerBuilder::UnCompletedClusterTask(
-    Runner* runner, const std::shared_ptr<TableHandler> table_handler,
-    std::string index) {
-    return ClusterTask(runner, table_handler, index);
-}
-ClusterTask RunnerBuilder::BuildRequestTask(RequestRunner* runner) {
-    if (nullptr == runner) {
-        LOG(WARNING) << "fail to build request task with null runner";
-        return ClusterTask();
-    }
-    ClusterTask request_task(runner);
-    request_task_ = std::make_shared<ClusterTask>(request_task);
-    return request_task;
-}
-ClusterTask RunnerBuilder::UnaryInheritTask(const ClusterTask& input,
-                                            Runner* runner) {
-    ClusterTask task = input;
-    runner->AddProducer(task.GetRoot());
-    task.SetRoot(runner);
-    return task;
+    return "kUnknow";
 }
 
 bool Runner::GetColumnBool(const int8_t* buf, const RowView* row_view, int idx,
@@ -850,6 +153,8 @@ bool Runner::GetColumnBool(const int8_t* buf, const RowView* row_view, int idx,
     return key;
 }
 
+// cache the row into window and
+// if `is_instance`, compute window project for current row
 Row Runner::WindowProject(const int8_t* fn, const uint64_t row_key,
                           const Row row,
                           const codec::Row& parameter,
@@ -892,12 +197,15 @@ Row Runner::WindowProject(const int8_t* fn, const uint64_t row_key,
         window->PopFrontData();
     }
     if (append_slices > 0) {
-        return Row(base::RefCountedSlice::CreateManaged(
-                       out_buf, RowView::GetSize(out_buf)),
-                   append_slices, row);
+        if (FLAGS_enable_spark_unsaferow_format) {
+            // For UnsafeRowOpt, do not merge input row and return the single slice output row only
+            return Row(base::RefCountedSlice::CreateManaged(out_buf, RowView::GetSize(out_buf)));
+        } else {
+            return Row(append_slices, row, 1,
+                       Row(base::RefCountedSlice::CreateManaged(out_buf, RowView::GetSize(out_buf))));
+        }
     } else {
-        return Row(base::RefCountedSlice::CreateManaged(
-            out_buf, RowView::GetSize(out_buf)));
+        return Row(base::RefCountedSlice::CreateManaged(out_buf, RowView::GetSize(out_buf)));
     }
 }
 
@@ -976,19 +284,21 @@ std::shared_ptr<DataHandlerList> Runner::BatchRequestRun(RunnerContext& ctx) {
             return cached;
         }
     }
-    std::shared_ptr<DataHandlerVector> outputs =
-        std::make_shared<DataHandlerVector>();
+
+    std::shared_ptr<DataHandlerVector> outputs = std::make_shared<DataHandlerVector>();
     std::vector<std::shared_ptr<DataHandler>> inputs(producers_.size());
-    std::vector<std::shared_ptr<DataHandlerList>> batch_inputs(
-        producers_.size());
+    std::vector<std::shared_ptr<DataHandlerList>> batch_inputs(producers_.size());
     for (size_t idx = producers_.size(); idx > 0; idx--) {
         batch_inputs[idx - 1] = producers_[idx - 1]->BatchRequestRun(ctx);
     }
 
     for (size_t idx = 0; idx < ctx.GetRequestSize(); idx++) {
         inputs.clear();
-        for (size_t producer_idx = 0; producer_idx < producers_.size();
-             producer_idx++) {
+        for (size_t producer_idx = 0; producer_idx < producers_.size(); producer_idx++) {
+            if (batch_inputs[producer_idx] == nullptr) {
+                LOG(WARNING) << "the result of producer " <<  producer_idx << " is null";
+                return nullptr;
+            }
             inputs.push_back(batch_inputs[producer_idx]->Get(idx));
         }
         auto res = Run(ctx, inputs);
@@ -1171,7 +481,7 @@ std::shared_ptr<DataHandler> TableProjectRunner::Run(
         return std::shared_ptr<DataHandler>();
     }
 
-    if (kTableHandler != input->GetHanlderType()) {
+    if (kTableHandler != input->GetHandlerType()) {
         return std::shared_ptr<DataHandler>();
     }
     auto output_table = std::shared_ptr<MemTableHandler>(new MemTableHandler());
@@ -1184,7 +494,7 @@ std::shared_ptr<DataHandler> TableProjectRunner::Run(
     iter->SeekToFirst();
     int32_t cnt = 0;
     while (iter->Valid()) {
-        if (limit_cnt_ > 0 && cnt++ >= limit_cnt_) {
+        if (limit_cnt_.has_value() && cnt++ >= limit_cnt_) {
             break;
         }
         output_table->AddRow(project_gen_.Gen(iter->GetValue(), parameter));
@@ -1200,9 +510,31 @@ std::shared_ptr<DataHandler> RowProjectRunner::Run(
         LOG(WARNING) << "inputs size < 1";
         return std::shared_ptr<DataHandler>();
     }
-    auto row = std::dynamic_pointer_cast<RowHandler>(inputs[0]);
-    return std::shared_ptr<RowHandler>(
-        new MemRowHandler(project_gen_.Gen(row->GetValue(), ctx.GetParameterRow())));
+    auto& parameter = ctx.GetParameterRow();
+    auto input = inputs[0];
+    switch (input->GetHandlerType()) {
+        case kTableHandler: {
+            return std::shared_ptr<TableHandler>(new TableProjectWrapper(
+                std::dynamic_pointer_cast<TableHandler>(input),
+                parameter, &project_gen_.fun_));
+        }
+        case kPartitionHandler: {
+            return std::shared_ptr<TableHandler>(new PartitionProjectWrapper(
+                std::dynamic_pointer_cast<PartitionHandler>(input),
+                parameter, &project_gen_.fun_));
+        }
+        case kRowHandler: {
+            return std::shared_ptr<RowHandler>(new RowProjectWrapper(
+                std::dynamic_pointer_cast<RowHandler>(input),
+                parameter, &project_gen_.fun_));
+        }
+        default: {
+            LOG(WARNING) << "Fail run row project, invalid handler type "
+                         << input->GetHandlerTypeName();
+        }
+    }
+
+    return std::shared_ptr<DataHandler>();
 }
 
 std::shared_ptr<DataHandler> SimpleProjectRunner::Run(
@@ -1220,7 +552,7 @@ std::shared_ptr<DataHandler> SimpleProjectRunner::Run(
     }
 
     auto& parameter = ctx.GetParameterRow();
-    switch (input->GetHanlderType()) {
+    switch (input->GetHandlerType()) {
         case kTableHandler: {
             return std::shared_ptr<TableHandler>(new TableProjectWrapper(
                 std::dynamic_pointer_cast<TableHandler>(input),
@@ -1266,7 +598,7 @@ std::shared_ptr<DataHandler> SelectSliceRunner::Run(
         return nullptr;
     }
     auto& parameter = ctx.GetParameterRow();
-    switch (input->GetHanlderType()) {
+    switch (input->GetHandlerType()) {
         case kTableHandler: {
             return std::shared_ptr<TableHandler>(new TableProjectWrapper(
                 std::dynamic_pointer_cast<TableHandler>(input), parameter,
@@ -1319,14 +651,13 @@ std::shared_ptr<DataHandler> WindowAggRunner::Run(
     instance_partition_iter->SeekToFirst();
 
     // Partition Union Table
-    auto union_inpus = windows_union_gen_.RunInputs(ctx);
-    auto union_partitions = windows_union_gen_.PartitionEach(union_inpus, parameter);
+    auto union_inputs = windows_union_gen_.RunInputs(ctx);
+    auto union_partitions = windows_union_gen_.PartitionEach(union_inputs, parameter);
     // Prepare Join Tables
     auto join_right_tables = windows_join_gen_.RunInputs(ctx);
 
     // Compute output
-    std::shared_ptr<MemTableHandler> output_table =
-        std::shared_ptr<MemTableHandler>(new MemTableHandler());
+    std::shared_ptr<MemTableHandler> output_table = std::make_shared<MemTableHandler>();
     while (instance_partition_iter->Valid()) {
         auto key = instance_partition_iter->GetKey().ToString();
         RunWindowAggOnKey(parameter, instance_partition, union_partitions,
@@ -1389,23 +720,23 @@ void WindowAggRunner::RunWindowAggOnKey(
         union_segment_status[i] = IteratorStatus(ts);
     }
 
-    int32_t min_union_pos =
-        0 == unions_cnt
-            ? -1
-            : IteratorStatus::PickIteratorWithMininumKey(&union_segment_status);
+    int32_t min_union_pos = IteratorStatus::FindLastIteratorWithMininumKey(union_segment_status);
     int32_t cnt = output_table->GetCount();
-    HistoryWindow window(instance_window_gen_.range_gen_.window_range_);
+    HistoryWindow window(instance_window_gen_.range_gen_->window_range_);
     window.set_instance_not_in_window(instance_not_in_window_);
     window.set_exclude_current_time(exclude_current_time_);
+    window.set_without_order_by(without_order_by());
 
     while (instance_segment_iter->Valid()) {
-        if (limit_cnt_ > 0 && cnt >= limit_cnt_) {
+        if (limit_cnt_.has_value() && cnt >= limit_cnt_) {
             break;
         }
         const Row& instance_row = instance_segment_iter->GetValue();
-        uint64_t instance_order = instance_segment_iter->GetKey();
+        const uint64_t instance_order = instance_segment_iter->GetKey();
+
+        // construct the window
         while (min_union_pos >= 0 &&
-               union_segment_status[min_union_pos].key_ < instance_order) {
+               union_segment_status[min_union_pos].key_ <= instance_order) {
             Row row = union_segment_iters[min_union_pos]->GetValue();
             if (windows_join_gen_.Valid()) {
                 row = windows_join_gen_.Join(row, join_right_tables, parameter);
@@ -1423,18 +754,16 @@ void WindowAggRunner::RunWindowAggOnKey(
                     union_segment_iters[min_union_pos]->GetKey());
             }
             // Pick new mininum union pos
-            min_union_pos = IteratorStatus::PickIteratorWithMininumKey(
-                &union_segment_status);
+            min_union_pos = IteratorStatus::FindLastIteratorWithMininumKey(union_segment_status);
         }
+
         if (windows_join_gen_.Valid()) {
-            Row row = instance_row;
-            row = windows_join_gen_.Join(instance_row, join_right_tables, parameter);
-            output_table->AddRow(window_project_gen_.Gen(instance_segment_iter->GetKey(), row, parameter, true,
-                                                         append_slices_, &window));
+            Row row = windows_join_gen_.Join(instance_row, join_right_tables, parameter);
+            output_table->AddRow(
+                window_project_gen_.Gen(instance_order, row, parameter, true, append_slices_, &window));
         } else {
-            output_table->AddRow(window_project_gen_.Gen(
-                instance_segment_iter->GetKey(), instance_row, parameter, true,
-                append_slices_, &window));
+            output_table->AddRow(
+                window_project_gen_.Gen(instance_order, instance_row, parameter, true, append_slices_, &window));
         }
 
         cnt++;
@@ -1442,7 +771,7 @@ void WindowAggRunner::RunWindowAggOnKey(
     }
 }
 
-std::shared_ptr<DataHandler> RequestLastJoinRunner::Run(
+std::shared_ptr<DataHandler> RequestJoinRunner::Run(
     RunnerContext& ctx,
     const std::vector<std::shared_ptr<DataHandler>>& inputs) {  // NOLINT
     auto fail_ptr = std::shared_ptr<DataHandler>();
@@ -1455,22 +784,35 @@ std::shared_ptr<DataHandler> RequestLastJoinRunner::Run(
     if (!left || !right) {
         return std::shared_ptr<DataHandler>();
     }
-    if (kRowHandler != left->GetHanlderType()) {
-        return std::shared_ptr<DataHandler>();
-    }
-    auto left_row = std::dynamic_pointer_cast<RowHandler>(left)->GetValue();
-    auto &parameter = ctx.GetParameterRow();
-    if (output_right_only_) {
-        return std::shared_ptr<RowHandler>(new MemRowHandler(
-            join_gen_.RowLastJoinDropLeftSlices(left_row, right, parameter)));
+    if (kRowHandler == left->GetHandlerType()) {
+        // row last join table, compute in place
+        auto left_row = std::dynamic_pointer_cast<RowHandler>(left)->GetValue();
+        auto& parameter = ctx.GetParameterRow();
+        if (join_gen_->join_type_ == node::kJoinTypeLast) {
+            if (output_right_only_) {
+                return std::shared_ptr<RowHandler>(
+                    new MemRowHandler(join_gen_->RowLastJoinDropLeftSlices(left_row, right, parameter)));
+            } else {
+                return std::shared_ptr<RowHandler>(
+                    new MemRowHandler(join_gen_->RowLastJoin(left_row, right, parameter)));
+            }
+        } else if (join_gen_->join_type_ == node::kJoinTypeLeft) {
+            return join_gen_->LazyJoin(left, right, ctx.GetParameterRow());
+        } else {
+            LOG(WARNING) << "unsupport join type " << node::JoinTypeName(join_gen_->join_type_);
+            return {};
+        }
+    } else if (kPartitionHandler == left->GetHandlerType() && right->GetHandlerType() == kPartitionHandler) {
+        auto left_part = std::dynamic_pointer_cast<PartitionHandler>(left);
+        auto right_part = std::dynamic_pointer_cast<PartitionHandler>(right);
+        return join_gen_->LazyJoinOptimized(left_part, right_part, ctx.GetParameterRow());
     } else {
-        return std::shared_ptr<RowHandler>(
-            new MemRowHandler(join_gen_.RowLastJoin(left_row, right, parameter)));
+        return join_gen_->LazyJoin(left, right, ctx.GetParameterRow());
     }
 }
 
-std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
-                                                 const std::vector<std::shared_ptr<DataHandler>>& inputs) {
+std::shared_ptr<DataHandler> JoinRunner::Run(RunnerContext& ctx,
+                                             const std::vector<std::shared_ptr<DataHandler>>& inputs) {
     auto fail_ptr = std::shared_ptr<DataHandler>();
     if (inputs.size() < 2) {
         LOG(WARNING) << "inputs size < 2";
@@ -1488,10 +830,14 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
     }
     auto &parameter = ctx.GetParameterRow();
 
-    switch (left->GetHanlderType()) {
+    if (join_gen_->join_type_ == node::kJoinTypeLeft) {
+        return join_gen_->LazyJoin(left, right, parameter);
+    }
+
+    switch (left->GetHandlerType()) {
         case kTableHandler: {
-            if (join_gen_.right_group_gen_.Valid()) {
-                right = join_gen_.right_group_gen_.Partition(right, parameter);
+            if (join_gen_->right_group_gen_.Valid()) {
+                right = join_gen_->right_group_gen_.Partition(right, parameter);
             }
             if (!right) {
                 LOG(WARNING) << "fail to run last join: right partition is empty";
@@ -1502,8 +848,8 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
             auto output_table =
                 std::shared_ptr<MemTimeTableHandler>(new MemTimeTableHandler());
             output_table->SetOrderType(left_table->GetOrderType());
-            if (kPartitionHandler == right->GetHanlderType()) {
-                if (!join_gen_.TableJoin(
+            if (kPartitionHandler == right->GetHandlerType()) {
+                if (!join_gen_->TableJoin(
                         left_table,
                         std::dynamic_pointer_cast<PartitionHandler>(right),
                         parameter,
@@ -1511,7 +857,7 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
                     return fail_ptr;
                 }
             } else {
-                if (!join_gen_.TableJoin(
+                if (!join_gen_->TableJoin(
                         left_table,
                         std::dynamic_pointer_cast<TableHandler>(right),
                         parameter,
@@ -1522,8 +868,8 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
             return output_table;
         }
         case kPartitionHandler: {
-            if (join_gen_.right_group_gen_.Valid()) {
-                right = join_gen_.right_group_gen_.Partition(right, parameter);
+            if (join_gen_->right_group_gen_.Valid()) {
+                right = join_gen_->right_group_gen_.Partition(right, parameter);
             }
             if (!right) {
                 LOG(WARNING) << "fail to run last join: right partition is empty";
@@ -1534,8 +880,8 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
             auto left_partition =
                 std::dynamic_pointer_cast<PartitionHandler>(left);
             output_partition->SetOrderType(left_partition->GetOrderType());
-            if (kPartitionHandler == right->GetHanlderType()) {
-                if (!join_gen_.PartitionJoin(
+            if (kPartitionHandler == right->GetHandlerType()) {
+                if (!join_gen_->PartitionJoin(
                         left_partition,
                         std::dynamic_pointer_cast<PartitionHandler>(right),
                         parameter,
@@ -1544,7 +890,7 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
                 }
 
             } else {
-                if (!join_gen_.PartitionJoin(
+                if (!join_gen_->PartitionJoin(
                         left_partition,
                         std::dynamic_pointer_cast<TableHandler>(right),
                         parameter,
@@ -1557,454 +903,13 @@ std::shared_ptr<DataHandler> LastJoinRunner::Run(RunnerContext& ctx,
         case kRowHandler: {
             auto left_row = std::dynamic_pointer_cast<RowHandler>(left);
             return std::make_shared<MemRowHandler>(
-                join_gen_.RowLastJoin(left_row->GetValue(), right, parameter));
+                join_gen_->RowLastJoin(left_row->GetValue(), right, parameter));
         }
         default:
             return fail_ptr;
     }
 }
 
-std::shared_ptr<PartitionHandler> PartitionGenerator::Partition(
-    std::shared_ptr<DataHandler> input, const Row& parameter) {
-    switch (input->GetHanlderType()) {
-        case kPartitionHandler: {
-            return Partition(
-                std::dynamic_pointer_cast<PartitionHandler>(input), parameter);
-        }
-        case kTableHandler: {
-            return Partition(std::dynamic_pointer_cast<TableHandler>(input), parameter);
-        }
-        default: {
-            LOG(WARNING) << "Partition Fail: input isn't partition or table";
-            return std::shared_ptr<PartitionHandler>();
-        }
-    }
-}
-std::shared_ptr<PartitionHandler> PartitionGenerator::Partition(
-    std::shared_ptr<PartitionHandler> table, const Row& parameter) {
-    if (!key_gen_.Valid()) {
-        return table;
-    }
-    if (!table) {
-        return std::shared_ptr<PartitionHandler>();
-    }
-    auto output_partitions = std::shared_ptr<MemPartitionHandler>(
-        new MemPartitionHandler(table->GetSchema()));
-    auto partitions = std::dynamic_pointer_cast<PartitionHandler>(table);
-    auto iter = partitions->GetWindowIterator();
-    if (!iter) {
-        LOG(WARNING) << "Partition Fail: partition is Empty";
-        return std::shared_ptr<PartitionHandler>();
-    }
-    iter->SeekToFirst();
-    output_partitions->SetOrderType(table->GetOrderType());
-    while (iter->Valid()) {
-        auto segment_iter = iter->GetValue();
-        if (!segment_iter) {
-            iter->Next();
-            continue;
-        }
-        auto segment_key = iter->GetKey().ToString();
-        segment_iter->SeekToFirst();
-        while (segment_iter->Valid()) {
-            std::string keys = key_gen_.Gen(segment_iter->GetValue(), parameter);
-            output_partitions->AddRow(segment_key + "|" + keys,
-                                      segment_iter->GetKey(),
-                                      segment_iter->GetValue());
-            segment_iter->Next();
-        }
-        iter->Next();
-    }
-    return output_partitions;
-}
-std::shared_ptr<PartitionHandler> PartitionGenerator::Partition(
-    std::shared_ptr<TableHandler> table, const Row& parameter) {
-    auto fail_ptr = std::shared_ptr<PartitionHandler>();
-    if (!key_gen_.Valid()) {
-        return fail_ptr;
-    }
-    if (!table) {
-        return fail_ptr;
-    }
-    if (kTableHandler != table->GetHanlderType()) {
-        return fail_ptr;
-    }
-
-    auto output_partitions = std::shared_ptr<MemPartitionHandler>(
-        new MemPartitionHandler(table->GetSchema()));
-
-    auto iter = std::dynamic_pointer_cast<TableHandler>(table)->GetIterator();
-    if (!iter) {
-        LOG(WARNING) << "Fail to group empty table: table is empty";
-        return fail_ptr;
-    }
-    iter->SeekToFirst();
-    while (iter->Valid()) {
-        std::string keys = key_gen_.Gen(iter->GetValue(), parameter);
-        output_partitions->AddRow(keys, iter->GetKey(), iter->GetValue());
-        iter->Next();
-    }
-    output_partitions->SetOrderType(table->GetOrderType());
-    return output_partitions;
-}
-std::shared_ptr<DataHandler> SortGenerator::Sort(
-    std::shared_ptr<DataHandler> input, const bool reverse) {
-    if (!input || !is_valid_ || !order_gen_.Valid()) {
-        return input;
-    }
-    switch (input->GetHanlderType()) {
-        case kTableHandler:
-            return Sort(std::dynamic_pointer_cast<TableHandler>(input),
-                        reverse);
-        case kPartitionHandler:
-            return Sort(std::dynamic_pointer_cast<PartitionHandler>(input),
-                        reverse);
-        default: {
-            LOG(WARNING) << "Sort Fail: input isn't partition or table";
-            return std::shared_ptr<PartitionHandler>();
-        }
-    }
-}
-
-std::shared_ptr<PartitionHandler> SortGenerator::Sort(
-    std::shared_ptr<PartitionHandler> partition, const bool reverse) {
-    bool is_asc = reverse ? !is_asc_ : is_asc_;
-    if (!is_valid_) {
-        return partition;
-    }
-    if (!partition) {
-        return std::shared_ptr<PartitionHandler>();
-    }
-    if (!order_gen().Valid() &&
-        is_asc == (partition->GetOrderType() == kAscOrder)) {
-        DLOG(INFO) << "match the order redirect the table";
-        return partition;
-    }
-
-    DLOG(INFO) << "mismatch the order and sort it";
-    auto output =
-        std::shared_ptr<MemPartitionHandler>(new MemPartitionHandler());
-
-    auto iter = partition->GetWindowIterator();
-    if (!iter) {
-        LOG(WARNING) << "Sort partition fail: partition is Empty";
-        return std::shared_ptr<PartitionHandler>();
-    }
-    iter->SeekToFirst();
-    while (iter->Valid()) {
-        auto segment_iter = iter->GetValue();
-        if (!segment_iter) {
-            iter->Next();
-            continue;
-        }
-
-        auto key = iter->GetKey().ToString();
-        segment_iter->SeekToFirst();
-        while (segment_iter->Valid()) {
-            int64_t ts = order_gen_.Gen(segment_iter->GetValue());
-            output->AddRow(key, static_cast<uint64_t>(ts),
-                           segment_iter->GetValue());
-            segment_iter->Next();
-        }
-    }
-    if (order_gen_.Valid()) {
-        output->Sort(is_asc);
-    } else if (is_asc && OrderType::kDescOrder == partition->GetOrderType()) {
-        output->Reverse();
-    }
-    return output;
-}
-
-std::shared_ptr<TableHandler> SortGenerator::Sort(
-    std::shared_ptr<TableHandler> table, const bool reverse) {
-    bool is_asc = reverse ? !is_asc_ : is_asc_;
-    if (!table || !is_valid_) {
-        return table;
-    }
-    if (!order_gen().Valid() &&
-        is_asc == (table->GetOrderType() == kAscOrder)) {
-        return table;
-    }
-    auto output_table = std::shared_ptr<MemTimeTableHandler>(
-        new MemTimeTableHandler(table->GetSchema()));
-    output_table->SetOrderType(table->GetOrderType());
-    auto iter = std::dynamic_pointer_cast<TableHandler>(table)->GetIterator();
-    if (!iter) {
-        LOG(WARNING) << "Sort table fail: table is Empty";
-        return std::shared_ptr<TableHandler>();
-    }
-    iter->SeekToFirst();
-    while (iter->Valid()) {
-        if (order_gen_.Valid()) {
-            int64_t key = order_gen_.Gen(iter->GetValue());
-            output_table->AddRow(static_cast<uint64_t>(key), iter->GetValue());
-        } else {
-            output_table->AddRow(iter->GetKey(), iter->GetValue());
-        }
-        iter->Next();
-    }
-
-    if (order_gen_.Valid()) {
-        output_table->Sort(is_asc);
-    } else {
-        switch (table->GetOrderType()) {
-            case kDescOrder:
-                if (is_asc) {
-                    output_table->Reverse();
-                }
-                break;
-            case kAscOrder:
-                if (!is_asc) {
-                    output_table->Reverse();
-                }
-                break;
-            default: {
-                LOG(WARNING) << "Fail to Sort, order type invalid";
-                return std::shared_ptr<TableHandler>();
-            }
-        }
-    }
-    return output_table;
-}
-Row JoinGenerator::RowLastJoinDropLeftSlices(
-    const Row& left_row, std::shared_ptr<DataHandler> right, const Row& parameter) {
-    Row joined = RowLastJoin(left_row, right, parameter);
-    Row right_row(joined.GetSlice(left_slices_));
-    for (size_t offset = 1; offset < right_slices_; offset++) {
-        right_row.Append(joined.GetSlice(left_slices_ + offset));
-    }
-    return right_row;
-}
-Row JoinGenerator::RowLastJoin(const Row& left_row,
-                               std::shared_ptr<DataHandler> right,
-                               const Row& parameter) {
-    switch (right->GetHanlderType()) {
-        case kPartitionHandler: {
-            return RowLastJoinPartition(
-                left_row, std::dynamic_pointer_cast<PartitionHandler>(right), parameter);
-        }
-        case kTableHandler: {
-            return RowLastJoinTable(
-                left_row, std::dynamic_pointer_cast<TableHandler>(right), parameter);
-        }
-        case kRowHandler: {
-            auto right_table =
-                std::shared_ptr<MemTableHandler>(new MemTableHandler());
-            right_table->AddRow(
-                std::dynamic_pointer_cast<RowHandler>(right)->GetValue());
-            return RowLastJoinTable(left_row, right_table, parameter);
-        }
-        default: {
-            LOG(WARNING) << "Last Join right isn't row or table or partition";
-            return Row(left_slices_, left_row, right_slices_, Row());
-        }
-    }
-}
-Row JoinGenerator::RowLastJoinPartition(
-    const Row& left_row, std::shared_ptr<PartitionHandler> partition,
-    const Row& parameter) {
-    if (!index_key_gen_.Valid()) {
-        LOG(WARNING) << "can't join right partition table when partition "
-                        "keys is empty";
-        return Row();
-    }
-    std::string partition_key = index_key_gen_.Gen(left_row, parameter);
-    auto right_table = partition->GetSegment(partition_key);
-    return RowLastJoinTable(left_row, right_table, parameter);
-}
-Row JoinGenerator::RowLastJoinTable(const Row& left_row,
-                                    std::shared_ptr<TableHandler> table,
-                                    const Row& parameter) {
-    if (right_sort_gen_.Valid()) {
-        table = right_sort_gen_.Sort(table, true);
-    }
-    if (!table) {
-        LOG(WARNING) << "Last Join right table is empty";
-        return Row(left_slices_, left_row, right_slices_, Row());
-    }
-    auto right_iter = table->GetIterator();
-    if (!right_iter) {
-        LOG(WARNING) << "Last Join right table is empty";
-        return Row(left_slices_, left_row, right_slices_, Row());
-    }
-    right_iter->SeekToFirst();
-    if (!right_iter->Valid()) {
-        LOG(WARNING) << "Last Join right table is empty";
-        return Row(left_slices_, left_row, right_slices_, Row());
-    }
-
-    if (!left_key_gen_.Valid() && !condition_gen_.Valid()) {
-        return Row(left_slices_, left_row, right_slices_,
-                   right_iter->GetValue());
-    }
-
-    std::string left_key_str = "";
-    if (left_key_gen_.Valid()) {
-        left_key_str = left_key_gen_.Gen(left_row, parameter);
-    }
-    while (right_iter->Valid()) {
-        if (right_group_gen_.Valid()) {
-            auto right_key_str =
-                right_group_gen_.GetKey(right_iter->GetValue(), parameter);
-            if (left_key_gen_.Valid() && left_key_str != right_key_str) {
-                right_iter->Next();
-                continue;
-            }
-        }
-
-        Row joined_row(left_slices_, left_row, right_slices_,
-                       right_iter->GetValue());
-        if (!condition_gen_.Valid()) {
-            return joined_row;
-        }
-        if (condition_gen_.Gen(joined_row, parameter)) {
-            return joined_row;
-        }
-        right_iter->Next();
-    }
-    return Row(left_slices_, left_row, right_slices_, Row());
-}
-
-bool JoinGenerator::TableJoin(std::shared_ptr<TableHandler> left,
-                              std::shared_ptr<TableHandler> right,
-                              const Row& parameter,
-                              std::shared_ptr<MemTimeTableHandler> output) {
-    auto left_iter = left->GetIterator();
-    if (!left_iter) {
-        LOG(WARNING) << "Table Join with empty left table";
-        return false;
-    }
-    left_iter->SeekToFirst();
-    while (left_iter->Valid()) {
-        const Row& left_row = left_iter->GetValue();
-        output->AddRow(
-            left_iter->GetKey(),
-            Runner::RowLastJoinTable(left_slices_, left_row, right_slices_,
-                                     right, parameter, right_sort_gen_, condition_gen_));
-        left_iter->Next();
-    }
-    return true;
-}
-
-bool JoinGenerator::TableJoin(std::shared_ptr<TableHandler> left,
-                              std::shared_ptr<PartitionHandler> right,
-                              const Row& parameter,
-                              std::shared_ptr<MemTimeTableHandler> output) {
-    if (!left_key_gen_.Valid() && !index_key_gen_.Valid()) {
-        LOG(WARNING) << "can't join right partition table when neither left_key_gen_ or index_key_gen_ is valid";
-        return false;
-    }
-    auto left_iter = left->GetIterator();
-
-    if (!left_iter) {
-        LOG(WARNING) << "fail to run last join: left input empty";
-        return false;
-    }
-
-    left_iter->SeekToFirst();
-    while (left_iter->Valid()) {
-        const Row& left_row = left_iter->GetValue();
-        std::string key_str =
-            index_key_gen_.Valid() ? index_key_gen_.Gen(left_row, parameter) : "";
-        if (left_key_gen_.Valid()) {
-            key_str = key_str.empty()
-                          ? left_key_gen_.Gen(left_row, parameter)
-                          : key_str + "|" + left_key_gen_.Gen(left_row, parameter);
-        }
-        DLOG(INFO) << "key_str " << key_str;
-        auto right_table = right->GetSegment(key_str);
-        output->AddRow(left_iter->GetKey(), Runner::RowLastJoinTable(left_slices_, left_row, right_slices_, right_table,
-                                                                     parameter, right_sort_gen_, condition_gen_));
-        left_iter->Next();
-    }
-    return true;
-}
-
-bool JoinGenerator::PartitionJoin(std::shared_ptr<PartitionHandler> left,
-                                  std::shared_ptr<TableHandler> right,
-                                  const Row& parameter,
-                                  std::shared_ptr<MemPartitionHandler> output) {
-    auto left_window_iter = left->GetWindowIterator();
-    if (!left_window_iter) {
-        LOG(WARNING) << "fail to run last join: left iter empty";
-        return false;
-    }
-    left_window_iter->SeekToFirst();
-    while (left_window_iter->Valid()) {
-        auto left_iter = left_window_iter->GetValue();
-        auto left_key = left_window_iter->GetKey();
-        if (!left_iter) {
-            left_window_iter->Next();
-            continue;
-        }
-        left_iter->SeekToFirst();
-        while (left_iter->Valid()) {
-            const Row& left_row = left_iter->GetValue();
-            auto key_str = std::string(
-                reinterpret_cast<const char*>(left_key.buf()), left_key.size());
-            output->AddRow(key_str, left_iter->GetKey(),
-                           Runner::RowLastJoinTable(
-                               left_slices_, left_row, right_slices_, right,
-                               parameter,
-                               right_sort_gen_, condition_gen_));
-            left_iter->Next();
-        }
-        left_window_iter->Next();
-    }
-    return true;
-}
-bool JoinGenerator::PartitionJoin(std::shared_ptr<PartitionHandler> left,
-                                  std::shared_ptr<PartitionHandler> right,
-                                  const Row& parameter,
-                                  std::shared_ptr<MemPartitionHandler> output) {
-    if (!left) {
-        LOG(WARNING) << "fail to run last join: left input empty";
-        return false;
-    }
-    auto left_partition_iter = left->GetWindowIterator();
-    if (!left_partition_iter) {
-        LOG(WARNING) << "fail to run last join: left input empty";
-        return false;
-    }
-    if (!index_key_gen_.Valid() && !left_key_gen_.Valid()) {
-        LOG(WARNING) << "can't join right partition table when join "
-                        "left_key_gen_ and index_key_gen_ are invalid";
-        return false;
-    }
-
-    left_partition_iter->SeekToFirst();
-    while (left_partition_iter->Valid()) {
-        auto left_iter = left_partition_iter->GetValue();
-        auto left_key = left_partition_iter->GetKey();
-        if (!left_iter) {
-            left_partition_iter->Next();
-            continue;
-        }
-        left_iter->SeekToFirst();
-        while (left_iter->Valid()) {
-            const Row& left_row = left_iter->GetValue();
-
-            std::string key_str = "";
-            if (index_key_gen_.Valid()) {
-                key_str = index_key_gen_.Gen(left_row, parameter);
-            }
-            if (left_key_gen_.Valid()) {
-                key_str = key_str.empty() ? left_key_gen_.Gen(left_row, parameter) : key_str.append("|").append
-                                                                                     (left_key_gen_.Gen(left_row, parameter));
-            }
-            auto right_table = right->GetSegment(key_str);
-            auto left_key_str = std::string(
-                reinterpret_cast<const char*>(left_key.buf()), left_key.size());
-            output->AddRow(left_key_str, left_iter->GetKey(),
-                           Runner::RowLastJoinTable(
-                               left_slices_, left_row, right_slices_,
-                               right_table, parameter, right_sort_gen_, condition_gen_));
-            left_iter->Next();
-        }
-        left_partition_iter->Next();
-    }
-    return true;
-}
 const Row Runner::RowLastJoinTable(size_t left_slices, const Row& left_row,
                                    size_t right_slices,
                                    std::shared_ptr<TableHandler> right_table,
@@ -2013,18 +918,15 @@ const Row Runner::RowLastJoinTable(size_t left_slices, const Row& left_row,
                                    ConditionGenerator& cond_gen) {
     right_table = right_sort.Sort(right_table, true);
     if (!right_table) {
-        LOG(WARNING) << "Last Join right table is empty";
         return Row(left_slices, left_row, right_slices, Row());
     }
     auto right_iter = right_table->GetIterator();
     if (!right_iter) {
-        DLOG(WARNING) << "Last Join right table is empty";
         return Row(left_slices, left_row, right_slices, Row());
     }
     right_iter->SeekToFirst();
 
     if (!right_iter->Valid()) {
-        LOG(WARNING) << "Last Join right table is empty";
         return Row(left_slices, left_row, right_slices, Row());
     }
 
@@ -2081,7 +983,7 @@ void Runner::PrintData(std::ostringstream& oss,
         return;
     }
 
-    switch (data->GetHanlderType()) {
+    switch (data->GetHandlerType()) {
         case kRowHandler: {
             auto row_handler = std::dynamic_pointer_cast<RowHandler>(data);
             if (!row_handler) {
@@ -2179,9 +1081,8 @@ void Runner::PrintData(std::ostringstream& oss,
                 break;
             }
             while (iter->Valid() && cnt++ < MAX_DEBUG_LINES_CNT) {
-                t.add("KEY: " + std::string(reinterpret_cast<const char*>(
-                                                iter->GetKey().buf()),
-                                            iter->GetKey().size()));
+                auto key = iter->GetKey();
+                t.add("KEY: " + key.ToString());
                 t.end_of_row();
                 auto segment_iter = iter->GetValue();
                 if (!segment_iter) {
@@ -2235,6 +1136,66 @@ void Runner::PrintData(std::ostringstream& oss,
     oss << t;
 }
 
+void Runner::PrintRow(std::ostringstream& oss, const vm::SchemasContext* schema_list, const Row& row) {
+    std::vector<RowView> row_view_list;
+    ::hybridse::base::TextTable t('-', '|', '+');
+    // Add Header
+    t.add("Row");
+
+    for (size_t i = 0; i < schema_list->GetSchemaSourceSize(); ++i) {
+        auto source = schema_list->GetSchemaSource(i);
+        for (int j = 0; j < source->GetSchema()->size(); j++) {
+            if (source->GetSourceName().empty()) {
+                t.add(source->GetSchema()->Get(j).name());
+            } else {
+                t.add(source->GetSourceName() + "." +
+                      source->GetSchema()->Get(j).name());
+            }
+            if (t.current_columns_size() >= MAX_DEBUG_COLUMN_MAX) {
+                break;
+            }
+        }
+        row_view_list.push_back(RowView(*source->GetSchema()));
+        if (t.current_columns_size() >= MAX_DEBUG_COLUMN_MAX) {
+            t.add("...");
+            break;
+        }
+    }
+
+    t.end_of_row();
+    if (row.empty()) {
+        t.add("Empty row");
+        t.end_of_row();
+        oss << t;
+        return;
+    }
+
+    t.add("0");
+    for (size_t id = 0; id < row_view_list.size(); id++) {
+        RowView& row_view = row_view_list[id];
+        row_view.Reset(row.buf(id), row.size(id));
+        for (int idx = 0; idx < schema_list->GetSchema(id)->size(); idx++) {
+            std::string str = row_view.GetAsString(idx);
+            t.add(str);
+            if (t.current_columns_size() >= MAX_DEBUG_COLUMN_MAX) {
+                break;
+            }
+        }
+        if (t.current_columns_size() >= MAX_DEBUG_COLUMN_MAX) {
+            t.add("...");
+            break;
+        }
+    }
+    t.end_of_row();
+    oss << t;
+}
+
+std::string Runner::GetPrettyRow(const vm::SchemasContext* schema_list, const Row& row) {
+    std::ostringstream os;
+    PrintRow(os, schema_list, row);
+    return os.str();
+}
+
 bool Runner::ExtractRows(std::shared_ptr<DataHandlerList> handlers,
 
                          std::vector<Row>& out_rows) {
@@ -2248,7 +1209,7 @@ bool Runner::ExtractRows(std::shared_ptr<DataHandlerList> handlers,
             out_rows.push_back(Row());
             continue;
         }
-        switch (handler->GetHanlderType()) {
+        switch (handler->GetHandlerType()) {
             case kTableHandler: {
                 auto iter = std::dynamic_pointer_cast<TableHandler>(handler)
                                 ->GetIterator();
@@ -2277,7 +1238,7 @@ bool Runner::ExtractRows(std::shared_ptr<DataHandlerList> handlers,
     return true;
 }
 bool Runner::ExtractRow(std::shared_ptr<DataHandler> handler, Row* out_row) {
-    switch (handler->GetHanlderType()) {
+    switch (handler->GetHandlerType()) {
         case kTableHandler: {
             auto iter =
                 std::dynamic_pointer_cast<TableHandler>(handler)->GetIterator();
@@ -2312,7 +1273,7 @@ bool Runner::ExtractRows(std::shared_ptr<DataHandler> handler,
         LOG(WARNING) << "Extract batch rows error: data handler is null";
         return false;
     }
-    switch (handler->GetHanlderType()) {
+    switch (handler->GetHandlerType()) {
         case kTableHandler: {
             auto iter =
                 std::dynamic_pointer_cast<TableHandler>(handler)->GetIterator();
@@ -2350,20 +1311,23 @@ std::shared_ptr<DataHandler> ConcatRunner::Run(
     auto right = inputs[1];
     auto left = inputs[0];
     size_t left_slices = producers_[0]->output_schemas()->GetSchemaSourceSize();
-    size_t right_slices =
-        producers_[1]->output_schemas()->GetSchemaSourceSize();
+    size_t right_slices = producers_[1]->output_schemas()->GetSchemaSourceSize();
     if (!left) {
         return std::shared_ptr<DataHandler>();
     }
-    switch (left->GetHanlderType()) {
+    switch (left->GetHandlerType()) {
         case kRowHandler:
-            return std::shared_ptr<RowHandler>(new RowCombineWrapper(
-                std::dynamic_pointer_cast<RowHandler>(left), left_slices,
-                std::dynamic_pointer_cast<RowHandler>(right), right_slices));
+            return std::shared_ptr<RowHandler>(
+                new RowCombineWrapper(std::dynamic_pointer_cast<RowHandler>(left), left_slices,
+                                      std::dynamic_pointer_cast<RowHandler>(right), right_slices));
         case kTableHandler:
-            return std::shared_ptr<TableHandler>(new ConcatTableHandler(
-                std::dynamic_pointer_cast<TableHandler>(left), left_slices,
-                std::dynamic_pointer_cast<TableHandler>(right), right_slices));
+            return std::shared_ptr<TableHandler>(
+                new ConcatTableHandler(std::dynamic_pointer_cast<TableHandler>(left), left_slices,
+                                       std::dynamic_pointer_cast<TableHandler>(right), right_slices));
+        case kPartitionHandler:
+            return std::shared_ptr<TableHandler>(
+                new ConcatPartitionHandler(std::dynamic_pointer_cast<PartitionHandler>(left), left_slices,
+                                           std::dynamic_pointer_cast<PartitionHandler>(right), right_slices));
         default: {
             LOG(WARNING)
                 << "fail to run conncat runner: handler type unsupported";
@@ -2385,23 +1349,10 @@ std::shared_ptr<DataHandler> LimitRunner::Run(
         LOG(WARNING) << "input is empty";
         return fail_ptr;
     }
-    switch (input->GetHanlderType()) {
+    switch (input->GetHandlerType()) {
         case kTableHandler: {
-            auto iter =
-                std::dynamic_pointer_cast<TableHandler>(input)->GetIterator();
-            if (!iter) {
-                LOG(WARNING) << "fail to get table it";
-                return fail_ptr;
-            }
-            iter->SeekToFirst();
-            auto output_table = std::shared_ptr<MemTableHandler>(
-                new MemTableHandler(input->GetSchema()));
-            int32_t cnt = 0;
-            while (cnt++ < limit_cnt_ && iter->Valid()) {
-                output_table->AddRow(iter->GetValue());
-                iter->Next();
-            }
-            return output_table;
+            return std::make_shared<LimitTableHandler>(std::dynamic_pointer_cast<TableHandler>(input),
+                                                       limit_cnt_.value());
         }
         case kRowHandler: {
             DLOG(INFO) << "limit row handler";
@@ -2411,6 +1362,8 @@ std::shared_ptr<DataHandler> LimitRunner::Run(
             LOG(WARNING) << "fail limit when input type isn't row or table";
             return fail_ptr;
         }
+        default:
+            break;
     }
     return fail_ptr;
 }
@@ -2429,14 +1382,12 @@ std::shared_ptr<DataHandler> FilterRunner::Run(
     }
     auto& parameter = ctx.GetParameterRow();
     // build window with start and end offset
-    switch (input->GetHanlderType()) {
+    switch (input->GetHandlerType()) {
         case kTableHandler: {
-            return filter_gen_.Filter(
-                std::dynamic_pointer_cast<TableHandler>(input), parameter);
+            return filter_gen_.Filter(std::dynamic_pointer_cast<TableHandler>(input), parameter, limit_cnt_);
         }
         case kPartitionHandler: {
-            return filter_gen_.Filter(
-                std::dynamic_pointer_cast<PartitionHandler>(input), parameter);
+            return filter_gen_.Filter(std::dynamic_pointer_cast<PartitionHandler>(input), parameter, limit_cnt_);
         }
         default: {
             LOG(WARNING) << "fail to filter when input is row";
@@ -2462,17 +1413,17 @@ std::shared_ptr<DataHandler> GroupAggRunner::Run(
     auto& parameter = ctx.GetParameterRow();
     auto output_table = std::shared_ptr<MemTableHandler>(new MemTableHandler());
 
-    if (kTableHandler == input->GetHanlderType()) {
+    if (kTableHandler == input->GetHandlerType()) {
         auto table = std::dynamic_pointer_cast<TableHandler>(input);
         if (!table) {
             LOG(WARNING) << "group aggregation fail: input table is null";
             return std::shared_ptr<DataHandler>();
         }
         if (!having_condition_.Valid() || having_condition_.Gen(table, parameter)) {
-            output_table->AddRow(agg_gen_.Gen(parameter, table));
+            output_table->AddRow(agg_gen_->Gen(parameter, table));
         }
         return output_table;
-    } else if (kPartitionHandler == input->GetHanlderType()) {
+    } else if (kPartitionHandler == input->GetHandlerType()) {
         auto partition = std::dynamic_pointer_cast<PartitionHandler>(input);
         auto iter = partition->GetWindowIterator();
         if (!iter) {
@@ -2482,9 +1433,6 @@ std::shared_ptr<DataHandler> GroupAggRunner::Run(
         iter->SeekToFirst();
         int32_t cnt = 0;
         while (iter->Valid()) {
-            if (limit_cnt_ > 0 && cnt++ >= limit_cnt_) {
-                break;
-            }
             auto key = iter->GetKey().ToString();
             auto segment = partition->GetSegment(key);
             if (!segment) {
@@ -2492,7 +1440,10 @@ std::shared_ptr<DataHandler> GroupAggRunner::Run(
                 return std::shared_ptr<DataHandler>();
             }
             if (!having_condition_.Valid() || having_condition_.Gen(segment, parameter)) {
-                output_table->AddRow(agg_gen_.Gen(parameter, segment));
+                if (limit_cnt_.has_value() && cnt++ >= limit_cnt_) {
+                    break;
+                }
+                output_table->AddRow(agg_gen_->Gen(parameter, segment));
             }
             iter->Next();
         }
@@ -2502,9 +1453,536 @@ std::shared_ptr<DataHandler> GroupAggRunner::Run(
         return std::shared_ptr<DataHandler>();
     }
 }
-std::shared_ptr<DataHandler> RequestUnionRunner::Run(
+
+bool RequestAggUnionRunner::InitAggregator() {
+    auto func_name = func_->GetName();
+    auto type_it = agg_type_map_.find(func_name);
+    if (type_it == agg_type_map_.end()) {
+        LOG(ERROR) << "RequestAggUnionRunner does not support for op " << func_name;
+        return false;
+    }
+
+    agg_type_ = type_it->second;
+    if (agg_col_->GetExprType() == node::kExprColumnRef) {
+        agg_col_type_ = producers_[1]->row_parser()->GetType(agg_col_name_);
+    } else if (agg_col_->GetExprType() == node::kExprAll) {
+        if (agg_type_ != kCount && agg_type_ != kCountWhere) {
+            LOG(ERROR) << "only support " << ExprTypeName(agg_col_->GetExprType()) << "on count op";
+            return false;
+        }
+        agg_col_type_ = type::Type::kInt64;
+    } else {
+        LOG(ERROR) << "non-support aggr expr type " << ExprTypeName(agg_col_->GetExprType());
+        return false;
+    }
+    return true;
+}
+
+std::unique_ptr<BaseAggregator> RequestAggUnionRunner::CreateAggregator() const {
+    switch (agg_type_) {
+        case kSum:
+        case kSumWhere:
+            return MakeOverflowAggregator<SumAggregator>(agg_col_type_, *output_schemas_->GetOutputSchema());
+        case kAvg:
+        case kAvgWhere:
+            return std::make_unique<AvgAggregator>(agg_col_type_, *output_schemas_->GetOutputSchema());
+        case kCount:
+        case kCountWhere:
+            return std::make_unique<CountAggregator>(agg_col_type_, *output_schemas_->GetOutputSchema());
+        case kMin:
+        case kMinWhere:
+            return MakeSameTypeAggregator<MinAggregator>(agg_col_type_, *output_schemas_->GetOutputSchema());
+        case kMax:
+        case kMaxWhere:
+            return MakeSameTypeAggregator<MaxAggregator>(agg_col_type_, *output_schemas_->GetOutputSchema());
+        default:
+            LOG(ERROR) << "RequestAggUnionRunner does not support for op " << func_->GetName();
+            return nullptr;
+    }
+}
+
+std::shared_ptr<DataHandler> RequestAggUnionRunner::Run(
     RunnerContext& ctx,
     const std::vector<std::shared_ptr<DataHandler>>& inputs) {
+    auto fail_ptr = std::shared_ptr<DataHandler>();
+    if (inputs.size() < 3u) {
+        LOG(WARNING) << "inputs size < 3";
+        return std::shared_ptr<DataHandler>();
+    }
+    auto request_handler = inputs[0];
+    auto base_handler = inputs[1];
+    auto agg_handler = inputs[2];
+    if (!request_handler || !base_handler || !agg_handler) {
+        return std::shared_ptr<DataHandler>();
+    }
+    if (kRowHandler != request_handler->GetHandlerType()) {
+        return std::shared_ptr<DataHandler>();
+    }
+
+    auto request = std::dynamic_pointer_cast<RowHandler>(request_handler)->GetValue();
+    int64_t ts_gen = range_gen_->Valid() ? range_gen_->ts_gen_.Gen(request) : -1;
+
+    // Prepare Union Window
+    auto union_inputs = windows_union_gen_->RunInputs(ctx);
+    if (ctx.is_debug()) {
+        for (size_t i = 0; i < union_inputs.size(); i++) {
+            std::ostringstream sss;
+            PrintData(sss, producers_[i + 1]->output_schemas(), union_inputs[i]);
+            LOG(INFO) << "union input " << i << ":\n" << sss.str();
+        }
+    }
+
+    auto& key_gen = windows_union_gen_->windows_gen_[0].index_seek_gen_.index_key_gen_;
+    std::string key = key_gen.Gen(request, ctx.GetParameterRow());
+    // do not use codegen to gen the union outputs for aggr segment
+    union_inputs.pop_back();
+
+    auto union_segments =
+        windows_union_gen_->GetRequestWindows(request, ctx.GetParameterRow(), union_inputs);
+    // code_gen result of agg_segment is not correct. we correct the result here
+    auto agg_segment = std::dynamic_pointer_cast<PartitionHandler>(union_inputs[1])->GetSegment(key);
+    if (agg_segment) {
+        union_segments.emplace_back(agg_segment);
+    }
+
+    if (ctx.is_debug()) {
+        for (size_t i = 0; i < union_segments.size(); i++) {
+            if (!union_segments[i]) continue;
+
+            std::ostringstream sss;
+            PrintData(sss, producers_[i + 1]->output_schemas(), union_segments[i]);
+            LOG(INFO) << "union output " << i << ":\n" << sss.str();
+        }
+    }
+
+    std::shared_ptr<TableHandler> window;
+    if (agg_segment) {
+        window = RequestUnionWindow(request, union_segments, ts_gen, range_gen_->window_range_, output_request_row_,
+                                    exclude_current_time_);
+    } else {
+        LOG(WARNING) << "Aggr segment is empty. Fall back to normal RequestUnionRunner";
+        window = RequestUnionRunner::RequestUnionWindow(request, union_segments, ts_gen, range_gen_->window_range_,
+                                                        true, exclude_current_time_);
+    }
+
+    return window;
+}
+
+std::shared_ptr<TableHandler> RequestAggUnionRunner::RequestUnionWindow(
+    const Row& request, std::vector<std::shared_ptr<TableHandler>> union_segments, int64_t ts_gen,
+    const WindowRange& window_range, const bool output_request_row, const bool exclude_current_time) const {
+    // TOOD(zhanghao): for now, we only support AggUnion with 1 base table and 1 agg table
+    size_t unions_cnt = union_segments.size();
+    if (unions_cnt != 2) {
+        LOG(ERROR) << "Not support of RequestAggUnion with more than 2 unions";
+        return nullptr;
+    }
+
+    if (!union_segments[0]) {
+        LOG(ERROR) << "base table is empty";
+        return nullptr;
+    }
+    if (!union_segments[1]) {
+        LOG(ERROR) << "agg table is empty";
+        return nullptr;
+    }
+
+    const auto base_row_parser = producers_[1]->row_parser();
+    const auto agg_row_parser = producers_[2]->row_parser();
+
+    int64_t start = 0;
+    int64_t end = INT64_MAX;
+    int64_t rows_start_preceding = 0;
+    int64_t max_size = 0;
+    if (ts_gen >= 0) {
+        if (window_range.frame_type_ != Window::kFrameRows) {
+            start = (ts_gen + window_range.start_offset_) < 0 ? 0 : (ts_gen + window_range.start_offset_);
+        }
+        if (exclude_current_time && 0 == window_range.end_offset_) {
+            end = (ts_gen - 1) < 0 ? 0 : (ts_gen - 1);
+        } else {
+            end = (ts_gen + window_range.end_offset_) < 0 ? 0 : (ts_gen + window_range.end_offset_);
+        }
+        rows_start_preceding = window_range.start_row_;
+        max_size = window_range.max_size_;
+    }
+    int64_t request_key = ts_gen > 0 ? ts_gen : 0;
+
+    auto aggregator = CreateAggregator();
+    auto update_base_aggregator = [aggregator = aggregator.get(), row_parser = base_row_parser, this](const Row& row) {
+        DLOG(INFO) << "[Update Base]\n" << GetPrettyRow(row_parser->schema_ctx(), row);
+        if (!agg_col_name_.empty() && row_parser->IsNull(row, agg_col_name_)) {
+            return;
+        }
+
+        if (cond_ != nullptr) {
+            // for those condition exists and evaluated to NULL/false
+            // will apply to functions `*_where`
+            // include `count_where` has supported, or `{min/max/avg/sum}_where` support later
+            auto matches = internal::EvalCond(row_parser, row, cond_);
+            DLOG(INFO) << "[Update Base Filter] Evaluate result of " << cond_->GetExprString() << ": "
+                       << PrintEvalValue(matches);
+            if (!matches.ok()) {
+                LOG(ERROR) << matches.status();
+                return;
+            }
+            if (false == matches->value_or(false)) {
+                return;
+            }
+        }
+
+        auto type = aggregator->type();
+        if (agg_type_ == kCount || agg_type_ == kCountWhere) {
+            dynamic_cast<Aggregator<int64_t>*>(aggregator)->UpdateValue(1);
+            return;
+        }
+
+        if (agg_col_name_.empty()) {
+            return;
+        }
+        switch (type) {
+            case type::Type::kInt16: {
+                int16_t val = 0;
+                row_parser->GetValue(row, agg_col_name_, type, &val);
+                AggregatorUpdate(aggregator, val);
+                break;
+            }
+            case type::Type::kDate:
+            case type::Type::kInt32: {
+                int32_t val = 0;
+                row_parser->GetValue(row, agg_col_name_, type, &val);
+                AggregatorUpdate(aggregator, val);
+                break;
+            }
+            case type::Type::kTimestamp:
+            case type::Type::kInt64: {
+                int64_t val = 0;
+                row_parser->GetValue(row, agg_col_name_, type, &val);
+                AggregatorUpdate(aggregator, val);
+                break;
+            }
+            case type::Type::kFloat: {
+                float val = 0;
+                row_parser->GetValue(row, agg_col_name_, type, &val);
+                AggregatorUpdate(aggregator, val);
+                break;
+            }
+            case type::Type::kDouble: {
+                double val = 0;
+                row_parser->GetValue(row, agg_col_name_, type, &val);
+                AggregatorUpdate(aggregator, val);
+                break;
+            }
+            case type::Type::kVarchar: {
+                std::string val;
+                row_parser->GetString(row, agg_col_name_, &val);
+                AggregatorUpdate(aggregator, val);
+                break;
+            }
+            default:
+                LOG(ERROR) << "Not support type: " << Type_Name(type);
+                break;
+        }
+    };
+
+    auto update_agg_aggregator = [aggregator = aggregator.get(), row_parser = agg_row_parser, this](const Row& row) {
+        DLOG(INFO) << "[Update Agg]\n" << GetPrettyRow(row_parser->schema_ctx(), row);
+        if (row_parser->IsNull(row, "agg_val")) {
+            return;
+        }
+
+        if (cond_ != nullptr) {
+            auto matches = internal::EvalCondWithAggRow(row_parser, row, cond_, "filter_key");
+            DLOG(INFO) << "[Update Agg Filter] Evaluate result of " << cond_->GetExprString() << ": "
+                       << PrintEvalValue(matches);
+            if (!matches.ok()) {
+                LOG(ERROR) << matches.status();
+                return;
+            }
+            if (false == matches->value_or(false)) {
+                return;
+            }
+        }
+
+        std::string agg_val;
+        row_parser->GetString(row, "agg_val", &agg_val);
+        aggregator->Update(agg_val);
+    };
+
+    int64_t cnt = 0;
+    auto range_status = window_range.GetWindowPositionStatus(cnt > rows_start_preceding, window_range.end_offset_ < 0,
+                                                             request_key < start);
+    if (output_request_row) {
+        update_base_aggregator(request);
+    }
+    if (WindowRange::kInWindow == range_status) {
+        cnt++;
+    }
+
+    auto window_table = std::make_shared<MemTimeTableHandler>();
+    auto base_it = union_segments[0]->GetIterator();
+    if (!base_it) {
+        LOG(INFO) << "Base window is empty.";
+        window_table->AddRow(start, aggregator->Output());
+        DLOG(INFO) << "REQUEST AGG UNION cnt = " << window_table->GetCount();
+        return window_table;
+    }
+    base_it->Seek(end);
+
+    auto agg_it = union_segments[1]->GetIterator();
+    if (agg_it) {
+        agg_it->Seek(end);
+    } else {
+        LOG(INFO) << "Agg window is empty. Use base window only";
+    }
+
+    // we'll iterate over the following ranges:
+    // 1. base(end_base, end] if end_base < end
+    // 2. agg[start_base, end_base]
+    // 3. base[start, start_base) if start < start_base
+    //
+    // | start .. | start_base ... end_base | .. end |
+    // | <-----------------   iterate order (end to start)
+    //
+    // when start_base > end_base, step 2 skipped, fallback as
+    // | start .. | end_base .. end |
+    // | <-----------------   iterate order (end to start)
+    std::optional<int64_t> end_base = start;
+    std::optional<int64_t> start_base = {};
+    if (agg_it) {
+        int64_t ts_start = -1;
+        int64_t ts_end = -1;
+
+        // iterate through agg_it and find the first one that
+        // - agg record inside window frame
+        //   - key (ts_start) >= start
+        //   - ts_end <= end
+        while (agg_it->Valid()) {
+            ts_start = agg_it->GetKey();
+            agg_row_parser->GetValue(agg_it->GetValue(), "ts_end", type::Type::kTimestamp, &ts_end);
+            if (ts_end <= end) {
+                break;
+            }
+
+            agg_it->Next();
+        }
+
+        if (ts_end != -1 && ts_start >= start) {
+            // first agg record inside window frame
+            end_base = ts_end;
+            // assign a value to start_base so agg aggregate happens
+            start_base = start + 1;
+        } /* else only base table will be used */
+    }
+
+    // NOTE: start_base is not correct util step 2 finished
+    DLOG(INFO) << absl::Substitute(
+        "[RequestUnion]($6) {start=$0, start_base=$1, end_base=$2, end=$3, base_key=$4, agg_key=$5}", start,
+        start_base.value_or(-1), end_base.value_or(-1), end, base_it->GetKey(), (agg_it ? agg_it->GetKey() : -1),
+        (cond_ ? cond_->GetExprString() : ""));
+
+    // 1. iterate over base table from [end, end_base) end (inclusive) to end_base (exclusive)
+    if (end_base < end) {
+        while (base_it->Valid()) {
+            if (max_size > 0 && cnt >= max_size) {
+                break;
+            }
+
+            int64_t ts = base_it->GetKey();
+            if (ts <= end_base) break;
+
+            auto range_status = window_range.GetWindowPositionStatus(cnt > rows_start_preceding, ts > end, ts < start);
+            if (WindowRange::kExceedWindow == range_status) {
+                break;
+            }
+            if (WindowRange::kInWindow == range_status) {
+                update_base_aggregator(base_it->GetValue());
+                cnt++;
+            }
+
+            base_it->Next();
+        }
+    }
+
+    // 2. iterate over agg table from end_base until start_base (both inclusive)
+    int64_t prev_ts_start = INT64_MAX;
+    while (start_base.has_value() && start_base <= end_base && agg_it != nullptr && agg_it->Valid()) {
+        if (max_size > 0 && cnt >= max_size) {
+            break;
+        }
+
+        if (cond_ == nullptr) {
+            const uint64_t ts_start = agg_it->GetKey();
+            const Row& row = agg_it->GetValue();
+            if (prev_ts_start == ts_start) {
+                DLOG(INFO) << "Found duplicate entries in agg table for ts_start = " << ts_start;
+                agg_it->Next();
+                continue;
+            }
+            prev_ts_start = ts_start;
+
+            int64_t ts_end = -1;
+            agg_row_parser->GetValue(row, "ts_end", type::Type::kTimestamp, &ts_end);
+            int num_rows = 0;
+            agg_row_parser->GetValue(row, "num_rows", type::Type::kInt32, &num_rows);
+
+            // FIXME(zhanghao): check cnt and rows_start_preceding meanings
+            int next_incr = num_rows > 0 ? num_rows - 1 : 0;
+            auto range_status = window_range.GetWindowPositionStatus(cnt + next_incr > rows_start_preceding,
+                                                                     ts_start > end, ts_start < start);
+            if ((max_size > 0 && cnt + next_incr >= max_size) || WindowRange::kExceedWindow == range_status) {
+                start_base = ts_end + 1;
+                break;
+            }
+            if (WindowRange::kInWindow == range_status) {
+                update_agg_aggregator(row);
+                cnt += num_rows;
+            }
+
+            start_base = ts_start;
+            agg_it->Next();
+        } else {
+            const uint64_t ts_start = agg_it->GetKey();
+
+            // for agg rows has filter_key
+            // max_size check should happen after iterate all agg rows for the same key
+            std::vector<Row> key_agg_rows;
+            std::set<std::string> filter_val_set;
+
+            int total_rows = 0;
+            int64_t ts_end_range = -1;
+            agg_row_parser->GetValue(agg_it->GetValue(), "ts_end", type::Type::kTimestamp, &ts_end_range);
+            while (agg_it->Valid() && ts_start == agg_it->GetKey()) {
+                const Row& drow = agg_it->GetValue();
+
+                std::string filter_val;
+                if (agg_row_parser->IsNull(drow, "filter_key")) {
+                    LOG(ERROR) << "filter_key is null for *_where op";
+                    agg_it->Next();
+                    continue;
+                }
+                if (0 != agg_row_parser->GetString(drow, "filter_key", &filter_val)) {
+                    LOG(ERROR) << "failed to get value of filter_key";
+                    agg_it->Next();
+                    continue;
+                }
+
+                if (prev_ts_start == ts_start && filter_val_set.count(filter_val) != 0) {
+                    DLOG(INFO) << "Found duplicate entries in agg table for ts_start = " << ts_start
+                               << ", filter_key=" << filter_val;
+                    agg_it->Next();
+                    continue;
+                }
+
+                prev_ts_start = ts_start;
+                filter_val_set.insert(filter_val);
+
+                int num_rows = 0;
+                agg_row_parser->GetValue(drow, "num_rows", type::Type::kInt32, &num_rows);
+
+                if (num_rows > 0) {
+                    total_rows += num_rows;
+                    key_agg_rows.push_back(drow);
+                }
+
+                agg_it->Next();
+            }
+
+            int next_incr = total_rows > 0 ? total_rows - 1 : 0;
+            auto range_status = window_range.GetWindowPositionStatus(cnt + next_incr > rows_start_preceding,
+                                                                     ts_start > end, ts_start < start);
+            if ((max_size > 0 && cnt + next_incr >= max_size) || WindowRange::kExceedWindow == range_status) {
+                start_base = ts_end_range + 1;
+                break;
+            }
+            if (WindowRange::kInWindow == range_status) {
+                for (auto& row : key_agg_rows) {
+                    update_agg_aggregator(row);
+                }
+                cnt += total_rows;
+            }
+
+            start_base = ts_start;
+        }
+    }
+
+    // 3. iterate over base table from start_base (exclusive) to start (inclusive)
+    //
+    // if start_base is empty ->
+    //     step 2 skiped, this step only agg on key = start
+    // otherwise ->
+    //    if start_base is 0 -> skiped
+    //    otherwise -> agg over [start, start_base)
+    int64_t step_3_start = start_base.value_or(start + 1);
+    if (step_3_start > 0) {
+        base_it->Seek(step_3_start - 1);
+        while (base_it->Valid()) {
+            int64_t ts = base_it->GetKey();
+            auto range_status = window_range.GetWindowPositionStatus(static_cast<int64_t>(cnt) > rows_start_preceding,
+                                                                     ts > end, static_cast<int64_t>(ts) < start);
+            if (WindowRange::kExceedWindow == range_status) {
+                break;
+            }
+            if (WindowRange::kInWindow == range_status) {
+                update_base_aggregator(base_it->GetValue());
+                cnt++;
+            }
+
+            base_it->Next();
+        }
+    }
+
+    window_table->AddRow(start, aggregator->Output());
+    DLOG(INFO) << "REQUEST AGG UNION cnt = " << window_table->GetCount();
+    return window_table;
+}
+
+std::string RequestAggUnionRunner::PrintEvalValue(const absl::StatusOr<std::optional<bool>>& val) {
+    std::ostringstream os;
+    if (!val.ok()) {
+        os << val.status();
+    } else {
+        os << (val->has_value() ? (val->value() ? "TRUE" : "FALSE") : "NULL");
+    }
+    return os.str();
+}
+
+std::shared_ptr<DataHandler> ReduceRunner::Run(
+    RunnerContext& ctx,
+    const std::vector<std::shared_ptr<DataHandler>>& inputs) {
+    if (inputs.size() < 1u) {
+        LOG(WARNING) << "inputs size < 1";
+        return std::shared_ptr<DataHandler>();
+    }
+    auto input = inputs[0];
+    if (!input) {
+        LOG(WARNING) << "input is empty";
+        return std::shared_ptr<DataHandler>();
+    }
+    if (kTableHandler != input->GetHandlerType()) {
+        LOG(WARNING) << "input is not a table handler";
+        return std::shared_ptr<DataHandler>();
+    }
+    auto table = std::dynamic_pointer_cast<TableHandler>(input);
+
+    auto parameter = ctx.GetParameterRow();
+    if (having_condition_.Valid() && !having_condition_.Gen(table, parameter)) {
+        return std::shared_ptr<DataHandler>();
+    }
+
+    auto iter = table->GetIterator();
+    iter->SeekToFirst();
+    if (!iter->Valid()) {
+        LOG(WARNING) << "ReduceRunner input is empty";
+        return std::shared_ptr<DataHandler>();
+    }
+    std::shared_ptr<RowHandler> row_handler = std::make_shared<MemRowHandler>(iter->GetValue());
+
+    return row_handler;
+}
+
+std::shared_ptr<DataHandler> RequestUnionRunner::Run(RunnerContext& ctx,
+                                                     const std::vector<std::shared_ptr<DataHandler>>& inputs) {
     auto fail_ptr = std::shared_ptr<DataHandler>();
     if (inputs.size() < 2u) {
         LOG(WARNING) << "inputs size < 2";
@@ -2515,50 +1993,64 @@ std::shared_ptr<DataHandler> RequestUnionRunner::Run(
     if (!left || !right) {
         return std::shared_ptr<DataHandler>();
     }
-    if (kRowHandler != left->GetHanlderType()) {
-        return std::shared_ptr<DataHandler>();
+    if (kRowHandler == left->GetHandlerType()) {
+        auto request = std::dynamic_pointer_cast<RowHandler>(left)->GetValue();
+        return RunOneRequest(&ctx, request);
+    } else if (kPartitionHandler == left->GetHandlerType()) {
+        auto left_part = std::dynamic_pointer_cast<PartitionHandler>(left);
+        auto func = std::bind(&RequestUnionRunner::RunOneRequest, this, &ctx, std::placeholders::_1);
+        return std::shared_ptr<TableHandler>(new LazyRequestUnionPartitionHandler(left_part, func));
     }
 
-    auto request = std::dynamic_pointer_cast<RowHandler>(left)->GetValue();
-
-    int64_t ts_gen = range_gen_.Valid() ? range_gen_.ts_gen_.Gen(request) : -1;
+    LOG(WARNING) << "skip due to performance: left source of request union is table handler(unoptimized)";
+    return std::shared_ptr<DataHandler>();
+}
+std::shared_ptr<TableHandler> RequestUnionRunner::RunOneRequest(RunnerContext* ctx, const Row& request) {
+    // ts_gen < 0 if there is no ORDER BY clause for WINDOW
+    int64_t ts_gen = range_gen_->Valid() ? range_gen_->ts_gen_.Gen(request) : -1;
 
     // Prepare Union Window
-    auto union_inputs = windows_union_gen_.RunInputs(ctx);
-    auto union_segments =
-        windows_union_gen_.GetRequestWindows(request, ctx.GetParameterRow(), union_inputs);
+    auto union_inputs = windows_union_gen_->RunInputs(*ctx);
+    auto union_segments = windows_union_gen_->GetRequestWindows(request, ctx->GetParameterRow(), union_inputs);
     // build window with start and end offset
-    return RequestUnionWindow(request, union_segments, ts_gen,
-                              range_gen_.window_range_, output_request_row_,
+    return RequestUnionWindow(request, union_segments, ts_gen, range_gen_->window_range_, output_request_row_,
                               exclude_current_time_);
 }
+
 std::shared_ptr<TableHandler> RequestUnionRunner::RequestUnionWindow(
-    const Row& request,
-    std::vector<std::shared_ptr<TableHandler>> union_segments, int64_t ts_gen,
-    const WindowRange& window_range, const bool output_request_row,
-    const bool exclude_current_time) {
-    uint64_t start = 0;
-    uint64_t end = UINT64_MAX;
-    uint64_t rows_start_preceding = 0;
-    uint64_t max_size = 0;
+    const Row& request, std::vector<std::shared_ptr<TableHandler>> union_segments, int64_t ts_gen,
+    const WindowRange& window_range, bool output_request_row, bool exclude_current_time) {
+    // range_start, range_end default to [0, MAX], so for the case without ORDER BY,
+    // RANGE-type WINDOW includes all rows in partition
+    uint64_t range_start = 0;
+    // range_end is empty means end value < 0, that there is no effective window range
+    // this happend when `ts_gen` is 0 and exclude current_time needed
+    std::optional<uint64_t> range_end = UINT64_MAX;
+    uint64_t rows_start_preceding = window_range.start_row_;
+    uint64_t max_size = window_range.max_size_;
     if (ts_gen >= 0) {
-        start = (ts_gen + window_range.start_offset_) < 0
+        range_start = (ts_gen + window_range.start_offset_) < 0
                     ? 0
                     : (ts_gen + window_range.start_offset_);
         if (exclude_current_time && 0 == window_range.end_offset_) {
-            end = (ts_gen - 1) < 0 ? 0 : (ts_gen - 1);
+            if (ts_gen == 0) {
+                range_end = {};
+            } else {
+                range_end = ts_gen - 1;
+            }
         } else {
-            end = (ts_gen + window_range.end_offset_) < 0
+            range_end = (ts_gen + window_range.end_offset_) < 0
                       ? 0
                       : (ts_gen + window_range.end_offset_);
         }
-        rows_start_preceding = window_range.start_row_;
-        max_size = window_range.max_size_;
     }
-    uint64_t request_key = ts_gen > 0 ? static_cast<uint64_t>(ts_gen) : 0;
+    // INT64_MAX is the magic number as row key of input row,
+    // when WINDOW without ORDER BY
+    //
+    // DONT BELIEVE THE UNSIGNED TYPE, codegen still use int64_t as data type
+    uint64_t request_key = ts_gen >= 0 ? static_cast<uint64_t>(ts_gen) : INT64_MAX;
 
-    auto window_table =
-        std::shared_ptr<MemTimeTableHandler>(new MemTimeTableHandler());
+    auto window_table = std::make_shared<MemTimeTableHandler>();
 
     size_t unions_cnt = union_segments.size();
     // Prepare Union Segment Iterators
@@ -2575,7 +2067,7 @@ std::shared_ptr<TableHandler> RequestUnionRunner::RequestUnionWindow(
             union_segment_status[i] = IteratorStatus();
             continue;
         }
-        union_segment_iters[i]->Seek(end);
+        union_segment_iters[i]->Seek(range_end.value_or(0));
         if (!union_segment_iters[i]->Valid()) {
             union_segment_status[i] = IteratorStatus();
             continue;
@@ -2583,19 +2075,17 @@ std::shared_ptr<TableHandler> RequestUnionRunner::RequestUnionWindow(
         uint64_t ts = union_segment_iters[i]->GetKey();
         union_segment_status[i] = IteratorStatus(ts);
     }
-    int32_t max_union_pos = 0 == unions_cnt
-                                ? -1
-                                : IteratorStatus::PickIteratorWithMaximizeKey(
-                                      &union_segment_status);
+    int32_t max_union_pos = IteratorStatus::FindFirstIteratorWithMaximizeKey(union_segment_status);
+
     uint64_t cnt = 0;
     auto range_status = window_range.GetWindowPositionStatus(
         cnt > rows_start_preceding, window_range.end_offset_ < 0,
-        request_key < start);
+        request_key < range_start);
     if (output_request_row) {
         window_table->AddRow(request_key, request);
-    }
-    if (WindowRange::kInWindow == range_status) {
-        cnt++;
+        if (WindowRange::kInWindow == range_status) {
+            cnt++;
+        }
     }
 
     while (-1 != max_union_pos) {
@@ -2604,8 +2094,8 @@ std::shared_ptr<TableHandler> RequestUnionRunner::RequestUnionWindow(
         }
         auto range_status = window_range.GetWindowPositionStatus(
             cnt > rows_start_preceding,
-            union_segment_status[max_union_pos].key_ > end,
-            union_segment_status[max_union_pos].key_ < start);
+            union_segment_status[max_union_pos].key_ > range_end,
+            union_segment_status[max_union_pos].key_ < range_start);
         if (WindowRange::kExceedWindow == range_status) {
             break;
         }
@@ -2624,8 +2114,7 @@ std::shared_ptr<TableHandler> RequestUnionRunner::RequestUnionWindow(
                 union_segment_iters[max_union_pos]->GetKey());
         }
         // Pick new mininum union pos
-        max_union_pos =
-            IteratorStatus::PickIteratorWithMaximizeKey(&union_segment_status);
+        max_union_pos = IteratorStatus::FindFirstIteratorWithMaximizeKey(union_segment_status);
     }
     DLOG(INFO) << "REQUEST UNION cnt = " << window_table->GetCount();
     return window_table;
@@ -2673,17 +2162,26 @@ std::shared_ptr<DataHandler> AggRunner::Run(
         LOG(WARNING) << "input is empty";
         return std::shared_ptr<DataHandler>();
     }
-    if (kTableHandler != input->GetHanlderType()) {
-        return std::shared_ptr<DataHandler>();
+
+    if (kTableHandler == input->GetHandlerType()) {
+        auto table = std::dynamic_pointer_cast<TableHandler>(input);
+        auto parameter = ctx.GetParameterRow();
+        if (having_condition_.Valid() && !having_condition_.Gen(table, parameter)) {
+            return std::shared_ptr<DataHandler>();
+        }
+        auto row_handler = std::shared_ptr<RowHandler>(new MemRowHandler(agg_gen_->Gen(parameter, table)));
+        return row_handler;
+    } else if (kPartitionHandler == input->GetHandlerType()) {
+        // lazify
+        auto data_set = std::dynamic_pointer_cast<LazyRequestUnionPartitionHandler>(input);
+        if (data_set == nullptr) {
+            return std::shared_ptr<DataHandler>();
+        }
+
+        return std::shared_ptr<DataHandler>(new LazyAggPartitionHandler(data_set, agg_gen_, ctx.GetParameterRow()));
     }
-    auto table = std::dynamic_pointer_cast<TableHandler>(input);
-    auto parameter = ctx.GetParameterRow();
-    if (having_condition_.Valid() && !having_condition_.Gen(table, parameter)) {
-        return std::shared_ptr<DataHandler>();
-    }
-    auto row_handler = std::shared_ptr<RowHandler>(new MemRowHandler(
-        agg_gen_.Gen(parameter, table)));
-    return row_handler;
+
+    return std::shared_ptr<DataHandler>();
 }
 std::shared_ptr<DataHandlerList> ProxyRequestRunner::BatchRequestRun(
     RunnerContext& ctx) {
@@ -2779,7 +2277,7 @@ std::shared_ptr<DataHandler> ProxyRequestRunner::Run(
     if (nullptr != index_input_) {
         index_input = index_input_->RunWithCache(ctx);
     }
-    switch (input->GetHanlderType()) {
+    switch (input->GetHandlerType()) {
         case kRowHandler: {
             auto row = std::dynamic_pointer_cast<RowHandler>(input)->GetValue();
             if (index_input) {
@@ -2821,8 +2319,7 @@ std::shared_ptr<DataHandler> ProxyRequestRunner::Run(
             }
         }
         default: {
-            LOG(WARNING)
-                << "fail to run proxy runner: handler type unsupported";
+            LOG(WARNING) << "fail to run proxy runner: handler type unsupported: " << input->GetHandlerTypeName();
             return fail_ptr;
         }
     }
@@ -2840,7 +2337,7 @@ std::shared_ptr<DataHandlerList> ProxyRequestRunner::RunBatchInput(
         LOG(WARNING) << "input is empty";
         return fail_ptr;
     }
-    switch (batch_input->Get(0)->GetHanlderType()) {
+    switch (batch_input->Get(0)->GetHandlerType()) {
         case kRowHandler: {
             bool input_batch_is_common = producers_[0]->need_batch_cache();
             if (input_batch_is_common || 1 == batch_input->GetSize()) {
@@ -3064,141 +2561,6 @@ std::shared_ptr<TableHandler> ProxyRequestRunner::RunWithRowsInput(
     return fail_ptr;
 }
 
-/**
- * TODO(chenjing): GenConst key during compile-time
- * @return
- */
-const std::string KeyGenerator::GenConst(const Row& parameter) {
-    Row key_row = CoreAPI::RowConstProject(fn_, parameter, true);
-    RowView row_view(row_view_);
-    if (!row_view.Reset(key_row.buf())) {
-        LOG(WARNING) << "fail to gen key: row view reset fail";
-        return "NA";
-    }
-    std::string keys = "";
-    for (auto pos : idxs_) {
-        std::string key =
-            row_view.IsNULL(pos)
-                ? codec::NONETOKEN
-                : fn_schema_.Get(pos).type() == hybridse::type::kDate
-                      ? std::to_string(row_view.GetDateUnsafe(pos))
-                      : row_view.GetAsString(pos);
-        if (key == "") {
-            key = codec::EMPTY_STRING;
-        }
-        if (!keys.empty()) {
-            keys.append("|");
-        }
-        keys.append(key);
-    }
-    return keys;
-}
-const std::string KeyGenerator::Gen(const Row& row, const Row& parameter) {
-    // TODO(wtz) 避免不必要的row project
-    if (row.size() == 0) {
-        return codec::NONETOKEN;
-    }
-    Row key_row = CoreAPI::RowProject(fn_, row, parameter, true);
-    std::string keys = "";
-    for (auto pos : idxs_) {
-        if (!keys.empty()) {
-            keys.append("|");
-        }
-        if (row_view_.IsNULL(key_row.buf(), pos)) {
-            keys.append(codec::NONETOKEN);
-            continue;
-        }
-        ::hybridse::type::Type type = fn_schema_.Get(pos).type();
-        switch (type) {
-            case ::hybridse::type::kVarchar: {
-                const char* buf = nullptr;
-                uint32_t size = 0;
-                if (row_view_.GetValue(key_row.buf(), pos, &buf, &size) == 0) {
-                    if (size == 0) {
-                        keys.append(codec::EMPTY_STRING.c_str(),
-                                    codec::EMPTY_STRING.size());
-                    } else {
-                        keys.append(buf, size);
-                    }
-                }
-                break;
-            }
-            case hybridse::type::kDate: {
-                int32_t buf = 0;
-                if (row_view_.GetValue(key_row.buf(), pos, type,
-                                       reinterpret_cast<void*>(&buf)) == 0) {
-                    keys.append(std::to_string(buf));
-                }
-                break;
-            }
-            case hybridse::type::kBool: {
-                bool buf = false;
-                if (row_view_.GetValue(key_row.buf(), pos, type,
-                                       reinterpret_cast<void*>(&buf)) == 0) {
-                    keys.append(buf ? "true" : "false");
-                }
-                break;
-            }
-            case hybridse::type::kInt16: {
-                int16_t buf = 0;
-                if (row_view_.GetValue(key_row.buf(), pos, type,
-                                       reinterpret_cast<void*>(&buf)) == 0) {
-                    keys.append(std::to_string(buf));
-                }
-                break;
-            }
-            case hybridse::type::kInt32: {
-                int32_t buf = 0;
-                if (row_view_.GetValue(key_row.buf(), pos, type,
-                                       reinterpret_cast<void*>(&buf)) == 0) {
-                    keys.append(std::to_string(buf));
-                }
-                break;
-            }
-            case hybridse::type::kInt64:
-            case hybridse::type::kTimestamp: {
-                int64_t buf = 0;
-                if (row_view_.GetValue(key_row.buf(), pos, type,
-                                       reinterpret_cast<void*>(&buf)) == 0) {
-                    keys.append(std::to_string(buf));
-                }
-                break;
-            }
-            default: {
-                DLOG(ERROR) << "unsupported: partition key's type is " << node::TypeName(type);
-                break;
-            }
-        }
-    }
-    return keys;
-}
-
-const int64_t OrderGenerator::Gen(const Row& row) {
-    Row order_row = CoreAPI::RowProject(fn_, row, Row(), true);
-    return Runner::GetColumnInt64(order_row.buf(), &row_view_, idxs_[0],
-                                  fn_schema_.Get(idxs_[0]).type());
-}
-
-const bool ConditionGenerator::Gen(const Row& row, const Row& parameter) const {
-    return CoreAPI::ComputeCondition(fn_, row, parameter, &row_view_, idxs_[0]);
-}
-const bool ConditionGenerator::Gen(std::shared_ptr<TableHandler> table, const codec::Row& parameter) {
-    Row cond_row = Runner::GroupbyProject(fn_, parameter, table.get());
-    return Runner::GetColumnBool(cond_row.buf(), &row_view_, idxs_[0],
-                                 row_view_.GetSchema()->Get(idxs_[0]).type());
-}
-const Row ProjectGenerator::Gen(const Row& row, const Row& parameter) {
-    return CoreAPI::RowProject(fn_, row, parameter, false);
-}
-
-const Row ConstProjectGenerator::Gen(const Row& parameter) {
-    return CoreAPI::RowConstProject(fn_, parameter, false);
-}
-
-const Row AggGenerator::Gen(const codec::Row& parameter_row, std::shared_ptr<TableHandler> table) {
-    return Runner::GroupbyProject(fn_, parameter_row, table.get());
-}
-
 Row Runner::GroupbyProject(const int8_t* fn, const codec::Row& parameter, TableHandler* table) {
     auto iter = table->GetIterator();
     if (!iter) {
@@ -3209,8 +2571,12 @@ Row Runner::GroupbyProject(const int8_t* fn, const codec::Row& parameter, TableH
     if (!iter->Valid()) {
         return Row();
     }
-    auto& row = iter->GetValue();
-    auto& row_key = iter->GetKey();
+    const auto& row = iter->GetValue();
+    const auto& row_key = iter->GetKey();
+
+    // Init current run step runtime
+    JitRuntime::get()->InitRunStep();
+
     auto udf = reinterpret_cast<int32_t (*)(const int64_t, const int8_t*,
                                             const int8_t*, const int8_t*, int8_t**)>(
         const_cast<int8_t*>(fn));
@@ -3224,6 +2590,10 @@ Row Runner::GroupbyProject(const int8_t* fn, const codec::Row& parameter, TableH
     auto window_ptr = reinterpret_cast<const int8_t*>(&window_ref);
 
     uint32_t ret = udf(row_key, row_ptr, window_ptr, parameter_ptr, &buf);
+
+    // Release current run step resources
+    JitRuntime::get()->ReleaseRunStep();
+
     if (ret != 0) {
         LOG(WARNING) << "fail to run udf " << ret;
         return Row();
@@ -3232,228 +2602,58 @@ Row Runner::GroupbyProject(const int8_t* fn, const codec::Row& parameter, TableH
         base::RefCountedSlice::CreateManaged(buf, RowView::GetSize(buf)));
 }
 
-const Row WindowProjectGenerator::Gen(const uint64_t key, const Row row,
-                                      const codec::Row& parameter,
-                                      bool is_instance, size_t append_slices,
-                                      Window* window) {
-    return Runner::WindowProject(fn_, key, row, parameter, is_instance, append_slices,
-                                 window);
-}
-
-std::vector<std::shared_ptr<DataHandler>> InputsGenerator::RunInputs(
-    RunnerContext& ctx) {
-    std::vector<std::shared_ptr<DataHandler>> union_inputs;
-    if (!input_runners_.empty()) {
-        for (auto runner : input_runners_) {
-            union_inputs.push_back(runner->RunWithCache(ctx));
-        }
-    }
-    return union_inputs;
-}
-std::vector<std::shared_ptr<PartitionHandler>>
-WindowUnionGenerator::PartitionEach(
-    std::vector<std::shared_ptr<DataHandler>> union_inputs,
-    const Row& parameter) {
-    std::vector<std::shared_ptr<PartitionHandler>> union_partitions;
-    if (!windows_gen_.empty()) {
-        union_partitions.reserve(windows_gen_.size());
-        for (size_t i = 0; i < inputs_cnt_; i++) {
-            union_partitions.push_back(
-                windows_gen_[i].partition_gen_.Partition(union_inputs[i], parameter));
-        }
-    }
-    return union_partitions;
-}
-int32_t IteratorStatus::PickIteratorWithMininumKey(
-    std::vector<IteratorStatus>* status_list_ptr) {
-    const auto& status_list = *status_list_ptr;
+int32_t IteratorStatus::FindLastIteratorWithMininumKey(const std::vector<IteratorStatus>& status_list) {
     int32_t min_union_pos = -1;
-    uint64_t min_union_order = UINT64_MAX;
+    std::optional<uint64_t> min_union_order;
     for (size_t i = 0; i < status_list.size(); i++) {
-        if (status_list[i].is_valid_ && status_list[i].key_ < min_union_order) {
-            min_union_order = status_list[i].key_;
-            min_union_pos = static_cast<int32_t>(i);
+        if (status_list[i].is_valid_) {
+            auto key = status_list[i].key_;
+            if (!min_union_order.has_value() || key <= min_union_order.value()) {
+                min_union_order.emplace(key);
+                min_union_pos = static_cast<int32_t>(i);
+            }
         }
     }
     return min_union_pos;
 }
-int32_t IteratorStatus::PickIteratorWithMaximizeKey(
-    std::vector<IteratorStatus>* status_list_ptr) {
-    const auto& status_list = *status_list_ptr;
+
+int32_t IteratorStatus::FindFirstIteratorWithMaximizeKey(const std::vector<IteratorStatus>& status_list) {
     int32_t min_union_pos = -1;
-    uint64_t min_union_order = 0;
+    std::optional<uint64_t> min_union_order;
     for (size_t i = 0; i < status_list.size(); i++) {
-        if (status_list[i].is_valid_ &&
-            status_list[i].key_ >= min_union_order) {
-            min_union_order = status_list[i].key_;
-            min_union_pos = static_cast<int32_t>(i);
+        if (status_list.at(i).is_valid_) {
+            auto key = status_list.at(i).key_;
+            if (!min_union_order.has_value() || key > min_union_order.value()) {
+                min_union_order.emplace(key);
+                min_union_pos = static_cast<int32_t>(i);
+            }
         }
     }
     return min_union_pos;
 }
-std::vector<std::shared_ptr<DataHandler>> WindowJoinGenerator::RunInputs(
-    RunnerContext& ctx) {
-    std::vector<std::shared_ptr<DataHandler>> union_inputs;
-    if (!input_runners_.empty()) {
-        for (auto runner : input_runners_) {
-            union_inputs.push_back(runner->RunWithCache(ctx));
+
+std::shared_ptr<DataHandler> SetOperationRunner::Run(RunnerContext& ctx,
+                                                     const std::vector<std::shared_ptr<DataHandler>>& inputs) {
+    bool opt = true;
+    for (auto& n : inputs) {
+        if (n->GetHandlerType() != kPartitionHandler) {
+            opt = false;
+            break;
         }
     }
-    return union_inputs;
-}
-Row WindowJoinGenerator::Join(
-    const Row& left_row,
-    const std::vector<std::shared_ptr<DataHandler>>& join_right_tables,
-    const Row& parameter) {
-    Row row = left_row;
-    for (size_t i = 0; i < join_right_tables.size(); i++) {
-        row = joins_gen_[i].RowLastJoin(row, join_right_tables[i], parameter);
-    }
-    return row;
-}
-
-std::shared_ptr<TableHandler> IndexSeekGenerator::SegmnetOfConstKey(
-    const Row& parameter,
-    std::shared_ptr<DataHandler> input) {
-    auto fail_ptr = std::shared_ptr<TableHandler>();
-    if (!input) {
-        LOG(WARNING) << "fail to seek segment of key: input is empty";
-        return fail_ptr;
-    }
-    if (!index_key_gen_.Valid()) {
-        switch (input->GetHanlderType()) {
-            case kPartitionHandler: {
-                LOG(WARNING) << "fail to seek segment: index key is empty";
-                return fail_ptr;
-            }
-            case kTableHandler: {
-                return std::dynamic_pointer_cast<TableHandler>(input);
-            }
-            default: {
-                LOG(WARNING) << "fail to seek segment when input is row";
-                return fail_ptr;
-            }
+    if (opt) {
+        std::vector<std::shared_ptr<PartitionHandler>> in;
+        for (auto n : inputs) {
+            in.emplace_back(PartitionHandler::Cast(n));
         }
+        return std::shared_ptr<DataHandler>(new SetOperationPartitionHandler(op_type_, in, distinct_));
     }
 
-    switch (input->GetHanlderType()) {
-        case kPartitionHandler: {
-            auto partition = std::dynamic_pointer_cast<PartitionHandler>(input);
-            auto key = index_key_gen_.GenConst(parameter);
-            return partition->GetSegment(key);
-        }
-        default: {
-            LOG(WARNING) << "fail to seek segment when input isn't partition";
-            return fail_ptr;
-        }
+    std::vector<std::shared_ptr<TableHandler>> in;
+    for (auto n : inputs) {
+        in.emplace_back(TableHandler::Cast(n));
     }
-}
-std::shared_ptr<TableHandler> IndexSeekGenerator::SegmentOfKey(
-    const Row& row, const Row& parameter, std::shared_ptr<DataHandler> input) {
-    auto fail_ptr = std::shared_ptr<TableHandler>();
-    if (!input) {
-        LOG(WARNING) << "fail to seek segment of key: input is empty";
-        return fail_ptr;
-    }
-    if (row.empty()) {
-        LOG(WARNING) << "fail to seek segment: key row is empty";
-        return fail_ptr;
-    }
-
-    if (!index_key_gen_.Valid()) {
-        switch (input->GetHanlderType()) {
-            case kPartitionHandler: {
-                LOG(WARNING) << "fail to seek segment: index key is empty";
-                return fail_ptr;
-            }
-            case kTableHandler: {
-                return std::dynamic_pointer_cast<TableHandler>(input);
-            }
-            default: {
-                LOG(WARNING) << "fail to seek segment when input is row";
-                return fail_ptr;
-            }
-        }
-    }
-
-    switch (input->GetHanlderType()) {
-        case kPartitionHandler: {
-            auto partition = std::dynamic_pointer_cast<PartitionHandler>(input);
-            auto key = index_key_gen_.Gen(row, parameter);
-            return partition->GetSegment(key);
-        }
-        default: {
-            LOG(WARNING) << "fail to seek segment when input isn't partition";
-            return fail_ptr;
-        }
-    }
-}
-
-std::shared_ptr<DataHandler> FilterGenerator::Filter(
-    std::shared_ptr<PartitionHandler> partition, const Row& parameter) {
-    if (!partition) {
-        LOG(WARNING) << "fail to filter table: input is empty";
-        return std::shared_ptr<DataHandler>();
-    }
-    if (index_seek_gen_.Valid()) {
-        return Filter(index_seek_gen_.SegmnetOfConstKey(parameter, partition), parameter);
-    } else {
-        if (!condition_gen_.Valid()) {
-            return partition;
-        }
-        return std::shared_ptr<PartitionHandler>(new PartitionFilterWrapper(partition, parameter, this));
-    }
-}
-std::shared_ptr<DataHandler> FilterGenerator::Filter(
-    std::shared_ptr<TableHandler> table,
-    const Row& parameter) {
-    auto fail_ptr = std::shared_ptr<TableHandler>();
-    if (!table) {
-        LOG(WARNING) << "fail to filter table: input is empty";
-        return fail_ptr;
-    }
-
-    if (!condition_gen_.Valid()) {
-        return table;
-    }
-    return std::shared_ptr<TableHandler>(new TableFilterWrapper(table, parameter, this));
-}
-
-std::shared_ptr<DataHandlerList> RunnerContext::GetBatchCache(
-    int64_t id) const {
-    auto iter = batch_cache_.find(id);
-    if (iter == batch_cache_.end()) {
-        return std::shared_ptr<DataHandlerList>();
-    } else {
-        return iter->second;
-    }
-}
-
-void RunnerContext::SetBatchCache(int64_t id,
-                                  std::shared_ptr<DataHandlerList> data) {
-    batch_cache_[id] = data;
-}
-
-std::shared_ptr<DataHandler> RunnerContext::GetCache(int64_t id) const {
-    auto iter = cache_.find(id);
-    if (iter == cache_.end()) {
-        return std::shared_ptr<DataHandler>();
-    } else {
-        return iter->second;
-    }
-}
-
-void RunnerContext::SetCache(int64_t id,
-                             const std::shared_ptr<DataHandler> data) {
-    cache_[id] = data;
-}
-
-void RunnerContext::SetRequest(const hybridse::codec::Row& request) {
-    request_ = request;
-}
-void RunnerContext::SetRequests(
-    const std::vector<hybridse::codec::Row>& requests) {
-    requests_ = requests;
+    return std::shared_ptr<DataHandler>(new SetOperationHandler(op_type_, in, distinct_));
 }
 }  // namespace vm
 }  // namespace hybridse

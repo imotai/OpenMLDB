@@ -20,7 +20,7 @@
 #include <array>
 #include <unordered_set>
 
-#include "base/glog_wapper.h"
+#include "base/glog_wrapper.h"
 #include "boost/lexical_cast.hpp"
 
 namespace openmldb {
@@ -87,25 +87,29 @@ RowBuilder::RowBuilder(const Schema& schema)
 
 void RowBuilder::SetSchemaVersion(uint8_t version) { schema_version_ = version; }
 
-bool RowBuilder::SetBuffer(int8_t* buf, uint32_t size) { return SetBuffer(buf, size, true); }
-
-bool RowBuilder::SetBuffer(int8_t* buf, uint32_t size, bool need_clear) {
+bool RowBuilder::InitBuffer(int8_t* buf, uint32_t size, bool need_clear) {
     if (buf == NULL || size == 0 || size < str_field_start_offset_ + str_field_cnt_) {
         return false;
     }
-    buf_ = buf;
-    size_ = size;
-    *(buf_) = 1;                    // FVersion
-    *(buf_ + 1) = schema_version_;  // SVersion
-    *(reinterpret_cast<uint32_t*>(buf_ + VERSION_LENGTH)) = size;
+    *(buf) = 1;                    // FVersion
+    *(buf + 1) = schema_version_;  // SVersion
+    *(reinterpret_cast<uint32_t*>(buf + VERSION_LENGTH)) = size;
     if (need_clear) {
         uint32_t bitmap_size = BitMapSize(schema_.size());
-        memset(buf_ + HEADER_LENGTH, 0xFF, bitmap_size);
+        memset(buf + HEADER_LENGTH, 0xFF, bitmap_size);
     }
+    return true;
+}
+
+bool RowBuilder::SetBuffer(int8_t* buf, uint32_t size) { return SetBuffer(buf, size, true); }
+
+bool RowBuilder::SetBuffer(int8_t* buf, uint32_t size, bool need_clear) {
+    buf_ = buf;
+    size_ = size;
     cnt_ = 0;
     str_addr_length_ = GetAddrLength(size);
     str_offset_ = str_field_start_offset_ + str_addr_length_ * str_field_cnt_;
-    return true;
+    return InitBuffer(buf_, size_, need_clear);
 }
 
 uint32_t RowBuilder::CalTotalLength(uint32_t string_length) {
@@ -146,10 +150,12 @@ bool RowBuilder::AppendDate(int32_t date) {
     return true;
 }
 
-bool RowBuilder::SetDate(uint32_t index, int32_t date) {
+bool RowBuilder::SetDate(uint32_t index, int32_t date) { return SetDate(buf_, index, date); }
+
+bool RowBuilder::SetDate(int8_t* buf, uint32_t index, int32_t date) {
     if (!Check(index, ::openmldb::type::kDate)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
     *(reinterpret_cast<int32_t*>(ptr)) = date;
     return true;
 }
@@ -161,21 +167,35 @@ bool RowBuilder::AppendDate(uint32_t year, uint32_t month, uint32_t day) {
 }
 
 bool RowBuilder::SetDate(uint32_t index, uint32_t year, uint32_t month, uint32_t day) {
+    return SetDate(buf_, index, year, month, day);
+}
+
+bool RowBuilder::ConvertDate(uint32_t year, uint32_t month, uint32_t day, uint32_t* val) {
     if (year < 1900 || year > 9999) return false;
     if (month < 1 || month > 12) return false;
     if (day < 1 || day > 31) return false;
-    if (!Check(index, ::openmldb::type::kDate)) return false;
-    int8_t* ptr = buf_ + offset_vec_[index];
-    int32_t data = (year - 1900) << 16;
-    data = data | ((month - 1) << 8);
-    data = data | day;
-    *(reinterpret_cast<int32_t*>(ptr)) = data;
-    SetField(index);
+    *val = (year - 1900) << 16;
+    *val = *val | ((month - 1) << 8);
+    *val = *val | day;
     return true;
 }
 
-void RowBuilder::SetField(uint32_t index) {
-    int8_t* ptr = buf_ + HEADER_LENGTH + (index >> 3);
+bool RowBuilder::SetDate(int8_t* buf, uint32_t index, uint32_t year, uint32_t month, uint32_t day) {
+    if (!Check(index, ::openmldb::type::kDate)) return false;
+    uint32_t date = 0;
+    if (!ConvertDate(year, month, day, &date)) {
+        return false;
+    }
+    int8_t* ptr = buf + offset_vec_[index];
+    *(reinterpret_cast<int32_t*>(ptr)) = date;
+    SetField(buf, index);
+    return true;
+}
+
+void RowBuilder::SetField(uint32_t index) { SetField(buf_, index); }
+
+void RowBuilder::SetField(int8_t* buf, uint32_t index) {
+    int8_t* ptr = buf + HEADER_LENGTH + (index >> 3);
     *(reinterpret_cast<uint8_t*>(ptr)) &= ~(1 << (index & 0x07));
 }
 
@@ -197,22 +217,68 @@ bool RowBuilder::SetNULL(uint32_t index) {
     return true;
 }
 
-void RowBuilder::SetStrOffset(uint32_t str_pos) {
+bool RowBuilder::SetNULL(int8_t* buf, uint32_t size, uint32_t index) {
+    const ::openmldb::common::ColumnDesc& column = schema_.Get(index);
+    if (column.not_null()) return false;
+    int8_t* ptr = buf + HEADER_LENGTH + (index >> 3);
+    *(reinterpret_cast<uint8_t*>(ptr)) |= 1 << (index & 0x07);
+    if (column.data_type() == ::openmldb::type::kVarchar || column.data_type() == openmldb::type::kString) {
+        uint32_t str_offset = 0;
+        uint32_t str_pos = offset_vec_[index];
+        auto str_addr_length = GetAddrLength(size);
+        if (str_pos == 0) {
+            str_offset = str_field_start_offset_ + str_addr_length * str_field_cnt_;
+        } else {
+            if (!GetStrOffset(buf, size, str_pos, &str_offset)) {
+                return false;
+            }
+        }
+        SetStrOffset(buf, size, str_pos + 1, str_offset);
+    }
+    return true;
+}
+
+void RowBuilder::SetStrOffset(uint32_t str_pos) { SetStrOffset(buf_, size_, str_pos, str_offset_); }
+
+void RowBuilder::SetStrOffset(int8_t* buf, uint32_t size, uint32_t str_pos, uint32_t str_offset) {
     if (str_pos >= str_field_cnt_) {
         return;
     }
-    int8_t* ptr = buf_ + str_field_start_offset_ + str_addr_length_ * str_pos;
-    if (str_addr_length_ == 1) {
-        *(reinterpret_cast<uint8_t*>(ptr)) = (uint8_t)str_offset_;
-    } else if (str_addr_length_ == 2) {
-        *(reinterpret_cast<uint16_t*>(ptr)) = (uint16_t)str_offset_;
-    } else if (str_addr_length_ == 3) {
-        *(reinterpret_cast<uint8_t*>(ptr)) = str_offset_ >> 16;
-        *(reinterpret_cast<uint8_t*>(ptr + 1)) = (str_offset_ & 0xFF00) >> 8;
-        *(reinterpret_cast<uint8_t*>(ptr + 2)) = str_offset_ & 0x00FF;
+    auto str_addr_length = GetAddrLength(size);
+    int8_t* ptr = buf + str_field_start_offset_ + str_addr_length * str_pos;
+    if (str_addr_length == 1) {
+        *(reinterpret_cast<uint8_t*>(ptr)) = (uint8_t)str_offset;
+    } else if (str_addr_length == 2) {
+        *(reinterpret_cast<uint16_t*>(ptr)) = (uint16_t)str_offset;
+    } else if (str_addr_length == 3) {
+        *(reinterpret_cast<uint8_t*>(ptr)) = str_offset >> 16;
+        *(reinterpret_cast<uint8_t*>(ptr + 1)) = (str_offset & 0xFF00) >> 8;
+        *(reinterpret_cast<uint8_t*>(ptr + 2)) = str_offset & 0x00FF;
     } else {
-        *(reinterpret_cast<uint32_t*>(ptr)) = str_offset_;
+        *(reinterpret_cast<uint32_t*>(ptr)) = str_offset;
     }
+}
+
+bool RowBuilder::GetStrOffset(int8_t* buf, uint32_t size, uint32_t str_pos, uint32_t* offset) {
+    if (str_pos >= str_field_cnt_) {
+        return false;
+    }
+    uint8_t str_addr_length = GetAddrLength(size);
+    int8_t* ptr = buf + str_field_start_offset_ + str_addr_length * str_pos;
+    if (str_addr_length == 1) {
+        *offset = *(reinterpret_cast<uint8_t*>(ptr));
+    } else if (str_addr_length == 2) {
+        *offset = *(reinterpret_cast<uint16_t*>(ptr));
+    } else if (str_addr_length == 3) {
+        *offset = *(reinterpret_cast<uint8_t*>(ptr));
+        *offset <<= 8;
+        *offset += *(reinterpret_cast<uint8_t*>(ptr + 1));
+        *offset <<= 8;
+        *offset += *(reinterpret_cast<uint8_t*>(ptr + 2));
+    } else {
+        *offset = *(reinterpret_cast<uint32_t*>(ptr));
+    }
+    return true;
 }
 
 bool RowBuilder::AppendBool(bool val) {
@@ -221,25 +287,13 @@ bool RowBuilder::AppendBool(bool val) {
     return true;
 }
 
-bool RowBuilder::SetBool(uint32_t index, bool val) {
+bool RowBuilder::SetBool(uint32_t index, bool val) { return SetBool(buf_, index, val); }
+
+bool RowBuilder::SetBool(int8_t* buf, uint32_t index, bool val) {
     if (!Check(index, ::openmldb::type::kBool)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
     *(reinterpret_cast<uint8_t*>(ptr)) = val ? 1 : 0;
-    return true;
-}
-
-bool RowBuilder::AppendInt32(int32_t val) {
-    if (!SetInt32(cnt_, val)) return false;
-    cnt_++;
-    return true;
-}
-
-bool RowBuilder::SetInt32(uint32_t index, int32_t val) {
-    if (!Check(index, ::openmldb::type::kInt)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
-    *(reinterpret_cast<int32_t*>(ptr)) = val;
     return true;
 }
 
@@ -249,25 +303,29 @@ bool RowBuilder::AppendInt16(int16_t val) {
     return true;
 }
 
-bool RowBuilder::SetInt16(uint32_t index, int16_t val) {
+bool RowBuilder::SetInt16(uint32_t index, int16_t val) { return SetInt16(buf_, index, val); }
+
+bool RowBuilder::SetInt16(int8_t* buf, uint32_t index, int16_t val) {
     if (!Check(index, ::openmldb::type::kSmallInt)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
     *(reinterpret_cast<int16_t*>(ptr)) = val;
     return true;
 }
 
-bool RowBuilder::AppendTimestamp(int64_t val) {
-    if (!SetTimestamp(cnt_, val)) return false;
+bool RowBuilder::AppendInt32(int32_t val) {
+    if (!SetInt32(cnt_, val)) return false;
     cnt_++;
     return true;
 }
 
-bool RowBuilder::SetTimestamp(uint32_t index, int64_t val) {
-    if (!Check(index, ::openmldb::type::kTimestamp)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
-    *(reinterpret_cast<int64_t*>(ptr)) = val;
+bool RowBuilder::SetInt32(uint32_t index, int32_t val) { return SetInt32(buf_, index, val); }
+
+bool RowBuilder::SetInt32(int8_t* buf, uint32_t index, int32_t val) {
+    if (!Check(index, ::openmldb::type::kInt)) return false;
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
+    *(reinterpret_cast<int32_t*>(ptr)) = val;
     return true;
 }
 
@@ -277,10 +335,28 @@ bool RowBuilder::AppendInt64(int64_t val) {
     return true;
 }
 
-bool RowBuilder::SetInt64(uint32_t index, int64_t val) {
+bool RowBuilder::SetInt64(uint32_t index, int64_t val) { return SetInt64(buf_, index, val); }
+
+bool RowBuilder::SetInt64(int8_t* buf, uint32_t index, int64_t val) {
     if (!Check(index, ::openmldb::type::kBigInt)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
+    *(reinterpret_cast<int64_t*>(ptr)) = val;
+    return true;
+}
+
+bool RowBuilder::AppendTimestamp(int64_t val) {
+    if (!SetTimestamp(cnt_, val)) return false;
+    cnt_++;
+    return true;
+}
+
+bool RowBuilder::SetTimestamp(uint32_t index, int64_t val) { return SetTimestamp(buf_, index, val); }
+
+bool RowBuilder::SetTimestamp(int8_t* buf, uint32_t index, int64_t val) {
+    if (!Check(index, ::openmldb::type::kTimestamp) || val < 0) return false;
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
     *(reinterpret_cast<int64_t*>(ptr)) = val;
     return true;
 }
@@ -291,10 +367,12 @@ bool RowBuilder::AppendFloat(float val) {
     return true;
 }
 
-bool RowBuilder::SetFloat(uint32_t index, float val) {
+bool RowBuilder::SetFloat(uint32_t index, float val) { return SetFloat(buf_, index, val); }
+
+bool RowBuilder::SetFloat(int8_t* buf, uint32_t index, float val) {
     if (!Check(index, ::openmldb::type::kFloat)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
     *(reinterpret_cast<float*>(ptr)) = val;
     return true;
 }
@@ -305,10 +383,12 @@ bool RowBuilder::AppendDouble(double val) {
     return true;
 }
 
-bool RowBuilder::SetDouble(uint32_t index, double val) {
+bool RowBuilder::SetDouble(uint32_t index, double val) { return SetDouble(buf_, index, val); }
+
+bool RowBuilder::SetDouble(int8_t* buf, uint32_t index, double val) {
     if (!Check(index, ::openmldb::type::kDouble)) return false;
-    SetField(index);
-    int8_t* ptr = buf_ + offset_vec_[index];
+    SetField(buf, index);
+    int8_t* ptr = buf + offset_vec_[index];
     *(reinterpret_cast<double*>(ptr)) = val;
     return true;
 }
@@ -334,6 +414,31 @@ bool RowBuilder::SetString(uint32_t index, const char* val, uint32_t length) {
     str_offset_ += length;
     SetStrOffset(str_pos + 1);
     SetField(index);
+    return true;
+}
+
+bool RowBuilder::SetString(int8_t* buf, uint32_t size, uint32_t index, const char* val, uint32_t length) {
+    if (val == NULL || (!Check(index, ::openmldb::type::kVarchar) && !Check(index, openmldb::type::kString))) {
+        return false;
+    }
+    uint32_t str_offset = 0;
+    uint32_t str_pos = offset_vec_[index];
+    auto str_addr_length = GetAddrLength(size);
+    if (str_pos == 0) {
+        str_offset = str_field_start_offset_ + str_addr_length * str_field_cnt_;
+        SetStrOffset(buf, size, str_pos, str_offset);
+    } else {
+        if (!GetStrOffset(buf, size, str_pos, &str_offset)) {
+            return false;
+        }
+    }
+    if (str_offset + length > size) return false;
+    if (length != 0) {
+        memcpy(reinterpret_cast<char*>(buf + str_offset), val, length);
+    }
+    str_offset += length;
+    SetStrOffset(buf, size, str_pos + 1, str_offset);
+    SetField(buf, index);
     return true;
 }
 
@@ -477,7 +582,7 @@ bool RowView::Reset(const int8_t* row) {
     return true;
 }
 
-bool RowView::CheckValid(uint32_t idx, ::openmldb::type::DataType type) {
+bool RowView::CheckValid(uint32_t idx, ::openmldb::type::DataType type) const {
     if (row_ == NULL || !is_valid_) {
         return false;
     }
@@ -491,7 +596,7 @@ bool RowView::CheckValid(uint32_t idx, ::openmldb::type::DataType type) {
     return true;
 }
 
-int32_t RowView::GetBool(uint32_t idx, bool* val) {
+int32_t RowView::GetBool(uint32_t idx, bool* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -511,7 +616,7 @@ int32_t RowView::GetBool(uint32_t idx, bool* val) {
     return 0;
 }
 
-int32_t RowView::GetDate(uint32_t idx, uint32_t* year, uint32_t* month, uint32_t* day) {
+int32_t RowView::GetDate(uint32_t idx, uint32_t* year, uint32_t* month, uint32_t* day) const {
     if (year == NULL || month == NULL || day == NULL) {
         return -1;
     }
@@ -530,7 +635,7 @@ int32_t RowView::GetDate(uint32_t idx, uint32_t* year, uint32_t* month, uint32_t
     return 0;
 }
 
-int32_t RowView::GetDate(uint32_t idx, int32_t* val) {
+int32_t RowView::GetDate(uint32_t idx, int32_t* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -545,7 +650,7 @@ int32_t RowView::GetDate(uint32_t idx, int32_t* val) {
     return 0;
 }
 
-int32_t RowView::GetInt32(uint32_t idx, int32_t* val) {
+int32_t RowView::GetInt32(uint32_t idx, int32_t* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -560,7 +665,7 @@ int32_t RowView::GetInt32(uint32_t idx, int32_t* val) {
     return 0;
 }
 
-int32_t RowView::GetTimestamp(uint32_t idx, int64_t* val) {
+int32_t RowView::GetTimestamp(uint32_t idx, int64_t* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -575,7 +680,7 @@ int32_t RowView::GetTimestamp(uint32_t idx, int64_t* val) {
     return 0;
 }
 
-int32_t RowView::GetInt64(uint32_t idx, int64_t* val) {
+int32_t RowView::GetInt64(uint32_t idx, int64_t* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -590,7 +695,7 @@ int32_t RowView::GetInt64(uint32_t idx, int64_t* val) {
     return 0;
 }
 
-int32_t RowView::GetInt16(uint32_t idx, int16_t* val) {
+int32_t RowView::GetInt16(uint32_t idx, int16_t* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -605,7 +710,7 @@ int32_t RowView::GetInt16(uint32_t idx, int16_t* val) {
     return 0;
 }
 
-int32_t RowView::GetFloat(uint32_t idx, float* val) {
+int32_t RowView::GetFloat(uint32_t idx, float* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -620,7 +725,7 @@ int32_t RowView::GetFloat(uint32_t idx, float* val) {
     return 0;
 }
 
-int32_t RowView::GetDouble(uint32_t idx, double* val) {
+int32_t RowView::GetDouble(uint32_t idx, double* val) const {
     if (val == NULL) {
         return -1;
     }
@@ -635,7 +740,7 @@ int32_t RowView::GetDouble(uint32_t idx, double* val) {
     return 0;
 }
 
-int32_t RowView::GetInteger(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, int64_t* val) {
+int32_t RowView::GetInteger(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, int64_t* val) const {
     int32_t ret = 0;
     switch (type) {
         case ::openmldb::type::kSmallInt: {
@@ -646,14 +751,14 @@ int32_t RowView::GetInteger(const int8_t* row, uint32_t idx, ::openmldb::type::D
         }
         case ::openmldb::type::kInt: {
             int32_t tmp_val = 0;
-            GetValue(row, idx, type, &tmp_val);
+            ret = GetValue(row, idx, type, &tmp_val);
             if (ret == 0) *val = tmp_val;
             break;
         }
         case ::openmldb::type::kTimestamp:
         case ::openmldb::type::kBigInt: {
             int64_t tmp_val = 0;
-            GetValue(row, idx, type, &tmp_val);
+            ret = GetValue(row, idx, type, &tmp_val);
             if (ret == 0) *val = tmp_val;
             break;
         }
@@ -663,7 +768,7 @@ int32_t RowView::GetInteger(const int8_t* row, uint32_t idx, ::openmldb::type::D
     return ret;
 }
 
-int32_t RowView::GetValue(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, void* val) {
+int32_t RowView::GetValue(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, void* val) const {
     if (schema_.size() == 0 || row == NULL) {
         return -1;
     }
@@ -716,7 +821,7 @@ int32_t RowView::GetValue(const int8_t* row, uint32_t idx, ::openmldb::type::Dat
     return 0;
 }
 
-int32_t RowView::GetValue(const int8_t* row, uint32_t idx, char** val, uint32_t* length) {
+int32_t RowView::GetValue(const int8_t* row, uint32_t idx, char** val, uint32_t* length) const {
     if (schema_.size() == 0 || row == NULL || length == NULL) {
         return -1;
     }
@@ -743,7 +848,7 @@ int32_t RowView::GetValue(const int8_t* row, uint32_t idx, char** val, uint32_t*
                            reinterpret_cast<int8_t**>(val), length);
 }
 
-int32_t RowView::GetString(uint32_t idx, char** val, uint32_t* length) {
+int32_t RowView::GetString(uint32_t idx, char** val, uint32_t* length) const {
     if (val == NULL || length == NULL) {
         return -1;
     }
@@ -763,9 +868,9 @@ int32_t RowView::GetString(uint32_t idx, char** val, uint32_t* length) {
                            reinterpret_cast<int8_t**>(val), length);
 }
 
-int32_t RowView::GetStrValue(uint32_t idx, std::string* val) { return GetStrValue(row_, idx, val); }
+int32_t RowView::GetStrValue(uint32_t idx, std::string* val) const { return GetStrValue(row_, idx, val); }
 
-int32_t RowView::GetStrValue(const int8_t* row, uint32_t idx, std::string* val) {
+int32_t RowView::GetStrValue(const int8_t* row, uint32_t idx, std::string* val) const {
     if (schema_.size() == 0 || row == NULL) {
         return -1;
     }
@@ -884,9 +989,7 @@ int32_t GetStrField(const int8_t* row, uint32_t field_offset, uint32_t next_str_
             }
             break;
         }
-        default: {
-            return -2;
-        }
+        default: { return -2; }
     }
     const int8_t* ptr = row + str_offset;
     *data = (int8_t*)(ptr);  // NOLINT
@@ -983,73 +1086,62 @@ bool RowProject::Project(const int8_t* row_ptr, uint32_t size, int8_t** output_p
     for (int32_t i = 0; i < plist_.size(); i++) {
         uint32_t idx = plist_.Get(i);
         const ::openmldb::common::ColumnDesc& column = cur_schema_->Get(idx);
-        int32_t ret = 0;
+        bool ret = false;
         if (cur_rv_->IsNULL(idx)) {
-            row_builder_->AppendNULL();
-            continue;
-        }
-        switch (column.data_type()) {
-            case ::openmldb::type::kBool: {
-                bool val = false;
-                ret = cur_rv_->GetBool(idx, &val);
-                if (ret == 0) row_builder_->AppendBool(val);
-                break;
-            }
-            case ::openmldb::type::kSmallInt: {
-                int16_t val = 0;
-                ret = cur_rv_->GetInt16(idx, &val);
-                if (ret == 0) row_builder_->AppendInt16(val);
-                break;
-            }
-            case ::openmldb::type::kInt: {
-                int32_t val = 0;
-                ret = cur_rv_->GetInt32(idx, &val);
-                if (ret == 0) row_builder_->AppendInt32(val);
-                break;
-            }
-            case ::openmldb::type::kDate: {
-                int32_t val = 0;
-                ret = cur_rv_->GetDate(idx, &val);
-                if (ret == 0) row_builder_->AppendDate(val);
-                break;
-            }
-            case ::openmldb::type::kBigInt: {
-                int64_t val = 0;
-                ret = cur_rv_->GetInt64(idx, &val);
-                if (ret == 0) row_builder_->AppendInt64(val);
-                break;
-            }
-            case ::openmldb::type::kTimestamp: {
-                int64_t val = 0;
-                ret = cur_rv_->GetTimestamp(idx, &val);
-                if (ret == 0) row_builder_->AppendTimestamp(val);
-                break;
-            }
-            case ::openmldb::type::kFloat: {
-                float val = 0;
-                ret = cur_rv_->GetFloat(idx, &val);
-                if (ret == 0) row_builder_->AppendFloat(val);
-                break;
-            }
-            case ::openmldb::type::kDouble: {
-                double val = 0;
-                ret = cur_rv_->GetDouble(idx, &val);
-                if (ret == 0) row_builder_->AppendDouble(val);
-                break;
-            }
-            case ::openmldb::type::kString:
-            case ::openmldb::type::kVarchar: {
-                char* val = NULL;
-                uint32_t size = 0;
-                ret = cur_rv_->GetString(idx, &val, &size);
-                if (ret == 0) row_builder_->AppendString(val, size);
-                break;
-            }
-            default: {
-                PDLOG(WARNING, "not supported type");
+            ret = row_builder_->AppendNULL();
+        } else {
+            switch (column.data_type()) {
+                case ::openmldb::type::kBool: {
+                    bool val = false;
+                    ret = cur_rv_->GetBool(idx, &val) == 0 && row_builder_->AppendBool(val);
+                    break;
+                }
+                case ::openmldb::type::kSmallInt: {
+                    int16_t val = 0;
+                    ret = cur_rv_->GetInt16(idx, &val) == 0 && row_builder_->AppendInt16(val);
+                    break;
+                }
+                case ::openmldb::type::kInt: {
+                    int32_t val = 0;
+                    ret = cur_rv_->GetInt32(idx, &val) == 0 && row_builder_->AppendInt32(val);
+                    break;
+                }
+                case ::openmldb::type::kDate: {
+                    int32_t val = 0;
+                    ret = cur_rv_->GetDate(idx, &val) == 0 && row_builder_->AppendDate(val);
+                    break;
+                }
+                case ::openmldb::type::kBigInt: {
+                    int64_t val = 0;
+                    ret = cur_rv_->GetInt64(idx, &val) == 0 && row_builder_->AppendInt64(val);
+                    break;
+                }
+                case ::openmldb::type::kTimestamp: {
+                    int64_t val = 0;
+                    ret = cur_rv_->GetTimestamp(idx, &val) == 0 && row_builder_->AppendTimestamp(val);
+                    break;
+                }
+                case ::openmldb::type::kFloat: {
+                    float val = 0;
+                    ret = cur_rv_->GetFloat(idx, &val) == 0 && row_builder_->AppendFloat(val);
+                    break;
+                }
+                case ::openmldb::type::kDouble: {
+                    double val = 0;
+                    ret = cur_rv_->GetDouble(idx, &val) == 0 && row_builder_->AppendDouble(val);
+                    break;
+                }
+                case ::openmldb::type::kString:
+                case ::openmldb::type::kVarchar: {
+                    char* val = NULL;
+                    uint32_t size = 0;
+                    ret = cur_rv_->GetString(idx, &val, &size) == 0 && row_builder_->AppendString(val, size);
+                    break;
+                }
+                default: { PDLOG(WARNING, "not supported type"); }
             }
         }
-        if (ret != 0) {
+        if (!ret) {
             delete[] ptr;
             PDLOG(WARNING, "fail to project column %s with idx %u", column.name().c_str(), idx);
             return false;
@@ -1058,6 +1150,16 @@ bool RowProject::Project(const int8_t* row_ptr, uint32_t size, int8_t** output_p
     *output_ptr = reinterpret_cast<int8_t*>(ptr);
     *out_size = total_size;
     return true;
+}
+
+bool ColumnSupportLegacyCodec(const openmldb::common::ColumnDesc& col_desc) {
+    auto dt = col_desc.data_type();
+    if (col_desc.has_schema()) {
+        dt = col_desc.schema().type();
+    }
+
+    return (dt >= openmldb::type::kBool && dt <= openmldb::type::kTimestamp) || dt == openmldb::type::kVarchar ||
+           dt == openmldb::type::kString;
 }
 
 }  // namespace codec

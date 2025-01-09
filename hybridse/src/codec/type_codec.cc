@@ -15,12 +15,15 @@
  */
 
 #include "codec/type_codec.h"
+
 #include <string>
 #include <utility>
+
 #include "base/mem_pool.h"
 #include "base/raw_buffer.h"
 #include "codec/fe_row_codec.h"
 #include "codec/list_iterator_codec.h"
+#include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "proto/fe_type.pb.h"
 
@@ -84,16 +87,11 @@ int32_t GetStrFieldUnsafe(const int8_t* row, uint32_t col_idx,
 
     // Support Spark UnsafeRow format
     if (FLAGS_enable_spark_unsaferow_format) {
-        // For UnsafeRow opt, str_start_offset is the nullbitmap size
-        const uint32_t bitmap_size = str_start_offset;
-        const int8_t* row_with_col_offset = row + HEADER_LENGTH + bitmap_size + col_idx * 8;
-
-        // For Spark UnsafeRow, the first 32 bits is for length and the last
-        // 32 bits is for offset.
-        *size = *(reinterpret_cast<const uint32_t*>(row_with_col_offset));
-        uint32_t str_value_offset = *(reinterpret_cast<const uint32_t*>(row_with_col_offset + 4)) + HEADER_LENGTH;
+        // Notice that for UnsafeRowOpt field_offset should be the actual offset of string column
+        // For Spark UnsafeRow, the first 32 bits is for length and the last 32 bits is for offset.
+        *size = *(reinterpret_cast<const uint32_t*>(row + field_offset));
+        uint32_t str_value_offset = *(reinterpret_cast<const uint32_t*>(row + field_offset + 4)) + HEADER_LENGTH;
         *data = reinterpret_cast<const char*>(row + str_value_offset);
-
         return 0;
     }
 
@@ -188,6 +186,14 @@ int32_t AppendString(int8_t* buf_ptr, uint32_t buf_size, uint32_t col_idx,
                      int8_t* val, uint32_t size, int8_t is_null,
                      uint32_t str_start_offset, uint32_t str_field_offset,
                      uint32_t str_addr_space, uint32_t str_body_offset) {
+    if (is_null) {
+        AppendNullBit(buf_ptr, col_idx, true);
+        size_t str_addr_length = GetAddrLength(buf_size);
+        FillNullStringOffset(buf_ptr, str_start_offset, str_addr_length,
+                             str_field_offset, str_body_offset);
+        return str_body_offset;
+    }
+
     if (FLAGS_enable_spark_unsaferow_format) {
         // TODO(chenjing): Refactor to support multiple codec instead of reusing the variable
         // For UnsafeRow opt, str_start_offset is the nullbitmap size
@@ -203,14 +209,6 @@ int32_t AppendString(int8_t* buf_ptr, uint32_t buf_size, uint32_t col_idx,
         }
 
         return str_body_offset + size;
-    }
-
-    if (is_null) {
-        AppendNullBit(buf_ptr, col_idx, true);
-        size_t str_addr_length = GetAddrLength(buf_size);
-        FillNullStringOffset(buf_ptr, str_start_offset, str_addr_length,
-                             str_field_offset, str_body_offset);
-        return str_body_offset;
     }
 
     uint32_t str_offset = str_start_offset + str_field_offset * str_addr_space;
@@ -254,9 +252,33 @@ int32_t AppendString(int8_t* buf_ptr, uint32_t buf_size, uint32_t col_idx,
     return str_body_offset + size;
 }
 
-int32_t GetStrCol(int8_t* input, int32_t row_idx, uint32_t col_idx,
-                  int32_t str_field_offset, int32_t next_str_field_offset,
-                  int32_t str_start_offset, int32_t type_id, int8_t* data) {
+void EncodeStrOffset(int8_t* str_offset_ptr, int32_t str_body_offset, int32_t str_addr_space) {
+    switch (str_addr_space) {
+        case 1: {
+            *str_offset_ptr = static_cast<uint8_t>(str_body_offset);
+            break;
+        }
+
+        case 2: {
+            *(reinterpret_cast<uint16_t*>(str_offset_ptr)) = static_cast<uint16_t>(str_body_offset);
+            break;
+        }
+
+        case 3: {
+            *(reinterpret_cast<uint8_t*>(str_offset_ptr)) = str_body_offset >> 16;
+            *(reinterpret_cast<uint8_t*>(str_offset_ptr + 1)) = (str_body_offset & 0xFF00) >> 8;
+            *(reinterpret_cast<uint8_t*>(str_offset_ptr + 2)) = str_body_offset & 0x00FF;
+            break;
+        }
+
+        default: {
+            *(reinterpret_cast<uint32_t*>(str_offset_ptr)) = str_body_offset;
+        }
+    }
+}
+
+int32_t GetStrCol(int8_t* input, int32_t row_idx, uint32_t col_idx, int32_t str_field_offset,
+                  int32_t next_str_field_offset, int32_t str_start_offset, int32_t type_id, int8_t* data) {
     if (nullptr == input || nullptr == data) {
         return -2;
     }
@@ -265,9 +287,16 @@ int32_t GetStrCol(int8_t* input, int32_t row_idx, uint32_t col_idx,
     hybridse::type::Type type = static_cast<hybridse::type::Type>(type_id);
     switch (type) {
         case hybridse::type::kVarchar: {
-            new (data)
-                StringColumnImpl(w, row_idx, col_idx, str_field_offset,
-                                 next_str_field_offset, str_start_offset);
+            // TODO(tobe): Update the row_idx as 0 for UnsafeRowOpt
+            if (FLAGS_enable_spark_unsaferow_format) {
+                new (data)
+                        StringColumnImpl(w, 0, col_idx, str_field_offset,
+                                         next_str_field_offset, str_start_offset);
+            } else {
+                new (data)
+                        StringColumnImpl(w, row_idx, col_idx, str_field_offset,
+                                         next_str_field_offset, str_start_offset);
+            }
             break;
         }
         default: {
@@ -308,11 +337,11 @@ int32_t GetCol(int8_t* input, int32_t row_idx, uint32_t col_idx, int32_t offset,
         }
         case hybridse::type::kTimestamp: {
             new (data)
-                ColumnImpl<codec::Timestamp>(w, row_idx, col_idx, offset);
+                ColumnImpl<openmldb::base::Timestamp>(w, row_idx, col_idx, offset);
             break;
         }
         case hybridse::type::kDate: {
-            new (data) ColumnImpl<codec::Date>(w, row_idx, col_idx, offset);
+            new (data) ColumnImpl<openmldb::base::Date>(w, row_idx, col_idx, offset);
             break;
         }
         case hybridse::type::kBool: {
@@ -353,6 +382,18 @@ int32_t GetInnerRowsList(int8_t* input, int64_t start_rows, int64_t end_rows,
     uint64_t start = start_rows < 0 ? 0 : start_rows;
     uint64_t end = end_rows < 0 ? 0 : end_rows;
     new (data) InnerRowsList<Row>(w, start, end);
+    return 0;
+}
+int32_t GetInnerRowsRangeList(int8_t* input, int64_t start_key, int64_t start_offset_rows, int64_t end_offset_range,
+                              int8_t* data) {
+    if (nullptr == input || nullptr == data) {
+        return -2;
+    }
+    ListV<Row>* w = reinterpret_cast<ListV<Row>*>(input);
+
+    uint64_t start = start_offset_rows < 0 ? 0 : start_offset_rows;
+    uint64_t end = start_key + end_offset_range < 0 ? 0 : start_key + end_offset_range;
+    new (data) InnerRowsRangeList<Row>(w, start, end);
     return 0;
 }
 }  // namespace v1

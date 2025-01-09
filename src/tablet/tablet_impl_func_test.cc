@@ -16,13 +16,9 @@
 
 #include <fcntl.h>
 #include <gflags/gflags.h>
-#include <google/protobuf/io/zero_copy_stream_impl.h>
-#include <google/protobuf/text_format.h>
 #include <sys/stat.h>
 
 #include "base/file_util.h"
-#include "base/glog_wapper.h"
-#include "base/kv_iterator.h"
 #include "base/strings.h"
 #include "codec/schema_codec.h"
 #include "codec/sdk_codec.h"
@@ -34,8 +30,11 @@
 #include "storage/mem_table.h"
 #include "storage/ticket.h"
 #include "tablet/tablet_impl.h"
+#include "test/util.h"
 
 DECLARE_string(db_root_path);
+DECLARE_string(ssd_root_path);
+DECLARE_string(hdd_root_path);
 DECLARE_string(zk_cluster);
 DECLARE_string(zk_root_path);
 DECLARE_int32(gc_interval);
@@ -48,10 +47,6 @@ namespace tablet {
 using ::openmldb::api::TableStatus;
 using ::openmldb::codec::SchemaCodec;
 
-inline std::string GenRand() {
-    return std::to_string(rand() % 10000000 + 1);  // NOLINT
-}
-
 ::openmldb::api::TableMeta GetTableMeta() {
     ::openmldb::api::TableMeta table_meta;
     table_meta.set_name("table");
@@ -60,7 +55,6 @@ inline std::string GenRand() {
     table_meta.set_seg_cnt(8);
     table_meta.set_mode(::openmldb::api::TableMode::kTableLeader);
     table_meta.set_key_entry_max_height(8);
-    table_meta.set_format_version(1);
     SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "card", ::openmldb::type::kString);
     SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "mcc", ::openmldb::type::kString);
     SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "price", ::openmldb::type::kBigInt);
@@ -71,8 +65,10 @@ inline std::string GenRand() {
 }
 
 void CreateBaseTable(::openmldb::storage::Table*& table,  // NOLINT
-                     const ::openmldb::type::TTLType& ttl_type, uint64_t ttl, uint64_t start_ts) {
+                     const ::openmldb::type::TTLType& ttl_type, uint64_t ttl, uint64_t start_ts,
+                     openmldb::common::StorageMode storage_mode) {
     auto table_meta = GetTableMeta();
+    table_meta.set_storage_mode(storage_mode);
     SchemaCodec::SetIndex(table_meta.add_column_key(), "card", "card", "ts1", ttl_type, ttl, ttl);
     SchemaCodec::SetIndex(table_meta.add_column_key(), "card1", "card", "ts2", ttl_type, ttl, ttl);
     SchemaCodec::SetIndex(table_meta.add_column_key(), "mcc", "card", "ts1", ttl_type, ttl, ttl);
@@ -93,12 +89,23 @@ void CreateBaseTable(::openmldb::storage::Table*& table,  // NOLINT
         dim->set_key(row[1]);
         std::string value;
         ASSERT_EQ(0, codec.EncodeRow(row, &value));
-        ASSERT_TRUE(table->Put(0, value, request.dimensions()));
+        ASSERT_TRUE(table->Put(0, value, request.dimensions()).ok());
     }
     return;
 }
 
-class TabletFuncTest : public ::testing::Test {
+class DiskTestEnvironment : public ::testing::Environment{
+    virtual void SetUp() {
+        ::openmldb::base::RemoveDirRecursive(FLAGS_hdd_root_path);
+        ::openmldb::base::RemoveDirRecursive(FLAGS_ssd_root_path);
+    }
+    virtual void TearDown() {
+        ::openmldb::base::RemoveDirRecursive(FLAGS_hdd_root_path);
+        ::openmldb::base::RemoveDirRecursive(FLAGS_ssd_root_path);
+    }
+};
+
+class TabletFuncTest : public ::testing::TestWithParam<::openmldb::common::StorageMode> {
  public:
     TabletFuncTest() {}
     ~TabletFuncTest() {}
@@ -307,9 +314,10 @@ void RunGetLatestIndexAssert(std::vector<QueryIt>* q_its) {
     }
 }
 
-TEST_F(TabletFuncTest, GetLatestIndex_default_iterator) {
+TEST_P(TabletFuncTest, GetLatestIndex_default_iterator) {
+    openmldb::common::StorageMode storage_mode = GetParam();
     ::openmldb::storage::Table* table;
-    CreateBaseTable(table, ::openmldb::type::TTLType::kLatestTime, 10, 1000);
+    CreateBaseTable(table, ::openmldb::type::TTLType::kLatestTime, 10, 1000, storage_mode);
     std::vector<QueryIt> query_its(1);
     query_its[0].ticket = std::make_shared<::openmldb::storage::Ticket>();
     ::openmldb::storage::TableIterator* it = table->NewIterator("card0", *query_its[0].ticket);
@@ -318,9 +326,10 @@ TEST_F(TabletFuncTest, GetLatestIndex_default_iterator) {
     RunGetLatestIndexAssert(&query_its);
 }
 
-TEST_F(TabletFuncTest, GetLatestIndex_ts0_iterator) {
+TEST_P(TabletFuncTest, GetLatestIndex_ts0_iterator) {
+    openmldb::common::StorageMode storage_mode = GetParam();
     ::openmldb::storage::Table* table = NULL;
-    CreateBaseTable(table, ::openmldb::type::TTLType::kLatestTime, 10, 1000);
+    CreateBaseTable(table, ::openmldb::type::TTLType::kLatestTime, 10, 1000, storage_mode);
     std::vector<QueryIt> query_its(1);
     query_its[0].ticket = std::make_shared<::openmldb::storage::Ticket>();
     ::openmldb::storage::TableIterator* it = table->NewIterator(0, "card0", *query_its[0].ticket);
@@ -329,9 +338,10 @@ TEST_F(TabletFuncTest, GetLatestIndex_ts0_iterator) {
     RunGetLatestIndexAssert(&query_its);
 }
 
-TEST_F(TabletFuncTest, GetLatestIndex_ts1_iterator) {
+TEST_P(TabletFuncTest, GetLatestIndex_ts1_iterator) {
+    openmldb::common::StorageMode storage_mode = GetParam();
     ::openmldb::storage::Table* table = NULL;
-    CreateBaseTable(table, ::openmldb::type::TTLType::kLatestTime, 10, 1000);
+    CreateBaseTable(table, ::openmldb::type::TTLType::kLatestTime, 10, 1000, storage_mode);
     std::vector<QueryIt> query_its(1);
     query_its[0].ticket = std::make_shared<::openmldb::storage::Ticket>();
     ::openmldb::storage::TableIterator* it = table->NewIterator(1, "card0", *query_its[0].ticket);
@@ -340,10 +350,11 @@ TEST_F(TabletFuncTest, GetLatestIndex_ts1_iterator) {
     RunGetLatestIndexAssert(&query_its);
 }
 
-TEST_F(TabletFuncTest, GetTimeIndex_default_iterator) {
+TEST_P(TabletFuncTest, GetTimeIndex_default_iterator) {
+    openmldb::common::StorageMode storage_mode = GetParam();
     uint64_t base_ts = ::baidu::common::timer::get_micros();
     ::openmldb::storage::Table* table = NULL;
-    CreateBaseTable(table, ::openmldb::type::TTLType::kAbsoluteTime, 1000, base_ts);
+    CreateBaseTable(table, ::openmldb::type::TTLType::kAbsoluteTime, 1000, base_ts, storage_mode);
     std::vector<QueryIt> query_its(1);
     query_its[0].ticket = std::make_shared<::openmldb::storage::Ticket>();
     ::openmldb::storage::TableIterator* it = table->NewIterator("card0", *query_its[0].ticket);
@@ -352,10 +363,11 @@ TEST_F(TabletFuncTest, GetTimeIndex_default_iterator) {
     RunGetTimeIndexAssert(&query_its, base_ts, base_ts - 100);
 }
 
-TEST_F(TabletFuncTest, GetTimeIndex_ts0_iterator) {
+TEST_P(TabletFuncTest, GetTimeIndex_ts0_iterator) {
+    openmldb::common::StorageMode storage_mode = GetParam();
     uint64_t base_ts = ::baidu::common::timer::get_micros();
     ::openmldb::storage::Table* table = NULL;
-    CreateBaseTable(table, ::openmldb::type::TTLType::kAbsoluteTime, 1000, base_ts);
+    CreateBaseTable(table, ::openmldb::type::TTLType::kAbsoluteTime, 1000, base_ts, storage_mode);
     std::vector<QueryIt> query_its(1);
     query_its[0].ticket = std::make_shared<::openmldb::storage::Ticket>();
     ::openmldb::storage::TableIterator* it = table->NewIterator(0, "card0", *query_its[0].ticket);
@@ -364,10 +376,11 @@ TEST_F(TabletFuncTest, GetTimeIndex_ts0_iterator) {
     RunGetTimeIndexAssert(&query_its, base_ts, base_ts - 100);
 }
 
-TEST_F(TabletFuncTest, GetTimeIndex_ts1_iterator) {
+TEST_P(TabletFuncTest, GetTimeIndex_ts1_iterator) {
+    openmldb::common::StorageMode storage_mode = GetParam();
     uint64_t base_ts = ::baidu::common::timer::get_micros();
     ::openmldb::storage::Table* table = NULL;
-    CreateBaseTable(table, ::openmldb::type::TTLType::kAbsoluteTime, 1000, base_ts);
+    CreateBaseTable(table, ::openmldb::type::TTLType::kAbsoluteTime, 1000, base_ts, storage_mode);
     std::vector<QueryIt> query_its(1);
     query_its[0].ticket = std::make_shared<::openmldb::storage::Ticket>();
     ::openmldb::storage::TableIterator* it = table->NewIterator(1, "card0", *query_its[0].ticket);
@@ -375,6 +388,10 @@ TEST_F(TabletFuncTest, GetTimeIndex_ts1_iterator) {
     query_its[0].table.reset(table);
     RunGetTimeIndexAssert(&query_its, base_ts, base_ts - 100);
 }
+
+INSTANTIATE_TEST_SUITE_P(TabletMemAndHDD, TabletFuncTest,
+                        ::testing::Values(::openmldb::common::kMemory, ::openmldb::common::kHDD,
+                                          ::openmldb::common::kSSD));
 
 }  // namespace tablet
 }  // namespace openmldb
@@ -382,5 +399,6 @@ TEST_F(TabletFuncTest, GetTimeIndex_ts1_iterator) {
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     srand(time(NULL));
+    ::openmldb::test::InitRandomDiskFlags("tablet_impl_func_test");
     return RUN_ALL_TESTS();
 }

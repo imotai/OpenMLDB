@@ -24,6 +24,7 @@
 
 #include "codegen/type_ir_builder.h"
 #include "plan/plan_api.h"
+#include "udf/udf.h"
 #include "udf/udf_registry.h"
 #include "vm/jit_wrapper.h"
 
@@ -44,11 +45,16 @@ std::shared_ptr<UdfRegistry> UdfLibrary::Find(
     const std::string& name,
     const std::vector<const node::TypeNode*>& arg_types) const {
     std::string canonical_name = GetCanonicalName(name);
-    auto iter = table_.find(canonical_name);
-    if (iter == table_.end()) {
-        return nullptr;
+    std::shared_ptr<UdfLibraryEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto iter = table_.find(canonical_name);
+        if (iter == table_.end()) {
+            return nullptr;
+        }
+        entry = iter->second;
     }
-    auto& signature_table = iter->second->signature_table;
+    auto& signature_table = entry->signature_table;
     std::shared_ptr<UdfRegistry> registry = nullptr;
     std::string signature;
     int variadic_pos = -1;
@@ -59,6 +65,7 @@ std::shared_ptr<UdfRegistry> UdfLibrary::Find(
 
 bool UdfLibrary::HasFunction(const std::string& name) const {
     std::string canonical_name = GetCanonicalName(name);
+    std::lock_guard<std::mutex> lock(mu_);
     return table_.find(canonical_name) != table_.end();
 }
 
@@ -70,13 +77,17 @@ void UdfLibrary::InsertRegistry(
     std::shared_ptr<UdfRegistry> registry) {
     std::string canonical_name = GetCanonicalName(name);
     std::shared_ptr<UdfLibraryEntry> entry = nullptr;
-    auto iter = table_.find(canonical_name);
-    if (iter == table_.end()) {
-        entry = std::make_shared<UdfLibraryEntry>();
-        table_.insert(iter, {canonical_name, entry});
-    } else {
-        entry = iter->second;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto iter = table_.find(canonical_name);
+        if (iter == table_.end()) {
+            entry = std::make_shared<UdfLibraryEntry>();
+            table_.insert(iter, {canonical_name, entry});
+        } else {
+            entry = iter->second;
+        }
     }
+    entry->fn_name = canonical_name;
     // set return list property
     if (always_return_list) {
         if (entry->signature_table.GetTable().size() == 0) {
@@ -119,6 +130,7 @@ void UdfLibrary::InsertRegistry(
 
 bool UdfLibrary::IsUdaf(const std::string& name, size_t args) const {
     std::string canonical_name = GetCanonicalName(name);
+    std::lock_guard<std::mutex> lock(mu_);
     auto iter = table_.find(canonical_name);
     if (iter == table_.end()) {
         return false;
@@ -128,6 +140,7 @@ bool UdfLibrary::IsUdaf(const std::string& name, size_t args) const {
 }
 bool UdfLibrary::IsUdaf(const std::string& name) const {
     std::string canonical_name = GetCanonicalName(name);
+    std::lock_guard<std::mutex> lock(mu_);
     auto iter = table_.find(canonical_name);
     if (iter == table_.end()) {
         return false;
@@ -136,6 +149,7 @@ bool UdfLibrary::IsUdaf(const std::string& name) const {
 }
 void UdfLibrary::SetIsUdaf(const std::string& name, size_t args) {
     std::string canonical_name = GetCanonicalName(name);
+    std::lock_guard<std::mutex> lock(mu_);
     auto iter = table_.find(canonical_name);
     if (iter == table_.end()) {
         LOG(WARNING) << canonical_name
@@ -147,6 +161,7 @@ void UdfLibrary::SetIsUdaf(const std::string& name, size_t args) {
 
 bool UdfLibrary::RequireListAt(const std::string& name, size_t index) const {
     std::string canonical_name = GetCanonicalName(name);
+    std::lock_guard<std::mutex> lock(mu_);
     auto entry_iter = table_.find(canonical_name);
     if (entry_iter == table_.end()) {
         return false;
@@ -158,6 +173,7 @@ bool UdfLibrary::RequireListAt(const std::string& name, size_t index) const {
 
 bool UdfLibrary::IsListReturn(const std::string& name) const {
     std::string canonical_name = GetCanonicalName(name);
+    std::lock_guard<std::mutex> lock(mu_);
     auto iter = table_.find(canonical_name);
     if (iter == table_.end()) {
         return false;
@@ -182,6 +198,92 @@ UdafRegistryHelper UdfLibrary::RegisterUdaf(const std::string& name) {
     return UdafRegistryHelper(GetCanonicalName(name), this);
 }
 
+Status UdfLibrary::RegisterDynamicUdf(const std::string& name, node::DataType return_type, bool return_nullable,
+        const std::vector<node::DataType>& arg_types, bool arg_nullable,
+        bool is_aggregate, const std::string& file) {
+    std::string canon_name = GetCanonicalName(name);
+
+    // TODO(tobe): openmldb-batch will register function twice, remove warning if it is fixed
+    // CHECK_TRUE(!HasFunction(canon_name), kCodegenError, name + " has exist")
+    if (HasFunction(canon_name)) {
+        if (file.empty()) {
+            return {kCodegenError, name + " has exist"};
+        }
+        LOG(WARNING) << "Function " + name + " has been registered, remove before overwrite";
+        RemoveDynamicUdf(name, arg_types, "");
+    }
+
+    std::vector<void*> funs;
+    if (file.empty()) {
+        // use trivial_fun for compile only
+        void* fun = reinterpret_cast<void*>(udf::v1::trivial_fun);
+        funs = {fun, fun, fun};
+    }  else {
+        CHECK_STATUS(lib_manager_.ExtractFunction(canon_name, is_aggregate, file, &funs))
+    }
+    Status status;
+    void* init_context_ptr =
+        reinterpret_cast<void*>(static_cast<void (*)(UDFContext* context)>(udf::v1::init_udfcontext));
+    if (is_aggregate) {
+        CHECK_TRUE(funs.size() == 3, kCodegenError, "cannot find function in so")
+        DynamicUdafRegistryHelperImpl helper(canon_name, this, return_type, return_nullable, arg_types, arg_nullable);
+        std::string lib_name = canon_name;
+        for (const auto type : arg_types) {
+            lib_name.append(".").append(node::DataTypeName(type));
+        }
+        helper.init(lib_name + ".init", init_context_ptr, funs[0])
+            .update(lib_name + ".update", funs[1])
+            .output(lib_name + ".output", funs[2]);
+    } else {
+        CHECK_TRUE(!funs.empty() && funs[0] != nullptr, kCodegenError, name + " is nullptr")
+        void* fn = funs[0];
+        DynamicUdfRegistryHelper helper(canon_name, this, fn, return_type, return_nullable,
+                arg_types, arg_nullable, init_context_ptr);
+        status = helper.Register();
+    }
+    if (!status.isOK()) {
+        lib_manager_.RemoveHandler(file);
+        return status;
+    }
+    return {};
+}
+
+Status UdfLibrary::RemoveDynamicUdf(const std::string& name, const std::vector<node::DataType>& arg_types,
+        const std::string& file) {
+    std::string canonical_name = GetCanonicalName(name);
+    std::string lib_name = canonical_name;
+    for (const auto type : arg_types) {
+        lib_name.append(".").append(node::DataTypeName(type));
+    }
+    if (!HasFunction(canonical_name)) {
+        return Status(kCodegenError, "can not find the function in udf table: " + canonical_name);
+    }
+    if (IsUdaf(canonical_name)) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (table_.erase(canonical_name) <= 0) {
+            return Status(kCodegenError, "udaf function not present in udf table: " + canonical_name);
+        }
+        if (external_symbols_.erase(lib_name + ".init") <= 0) {
+            return Status(kCodegenError, "can not find the init function in symbol table: " + lib_name);
+        }
+        if (external_symbols_.erase(lib_name + ".update") <= 0) {
+            return Status(kCodegenError, "can not find the update function in symbol table: " + lib_name);
+        }
+        if (external_symbols_.erase(lib_name + ".output") <= 0) {
+            return Status(kCodegenError, "can not find the output function in symbol table: " + lib_name);
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (table_.erase(canonical_name) <= 0) {
+            return Status(kCodegenError, "udf function not present in udf table: " + canonical_name);
+        }
+        if (external_symbols_.erase(lib_name) <= 0) {
+            return Status(kCodegenError, "can not find the function in symbol table: " + lib_name);
+        }
+    }
+    return lib_manager_.RemoveHandler(file);
+}
+
 Status UdfLibrary::RegisterAlias(const std::string& alias,
                                  const std::string& name) {
     std::string canonical_name = GetCanonicalName(name);
@@ -192,6 +294,9 @@ Status UdfLibrary::RegisterAlias(const std::string& alias,
     iter = table_.find(canonical_name);
     CHECK_TRUE(iter != table_.end(), kCodegenError,
                "Alias target Function name '", canonical_name, "' not found");
+    // update alias info
+    iter->second->alias.insert(canonical_name);
+
     table_[canonical_alias] = iter->second;
     return Status::OK();
 }
@@ -256,10 +361,15 @@ Status UdfLibrary::Transform(const std::string& name,
 Status UdfLibrary::Transform(const std::string& name, UdfResolveContext* ctx,
                              ExprNode** result) const {
     std::string canonical_name = GetCanonicalName(name);
-    auto iter = table_.find(canonical_name);
-    CHECK_TRUE(iter != table_.end(), kCodegenError,
-               "Fail to find registered function: ", canonical_name);
-    auto& signature_table = iter->second->signature_table;
+    std::shared_ptr<UdfLibraryEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto iter = table_.find(canonical_name);
+        CHECK_TRUE(iter != table_.end(), kCodegenError,
+                   "Fail to find registered function: ", canonical_name);
+        entry = iter->second;
+    }
+    auto& signature_table = entry->signature_table;
 
     std::shared_ptr<UdfRegistry> registry = nullptr;
     std::string signature;
@@ -270,7 +380,7 @@ Status UdfLibrary::Transform(const std::string& name, UdfResolveContext* ctx,
         ctx->GetArgSignature(), ">");
 
     DLOG(INFO) << "Resolve '" << canonical_name << "'<"
-               << ctx->GetArgSignature() << ">to " << canonical_name << "("
+               << ctx->GetArgSignature() << "> to " << canonical_name << "("
                << signature << ")";
     CHECK_TRUE(registry != nullptr, kCodegenError);
     return registry->Transform(ctx, result);
@@ -280,10 +390,15 @@ Status UdfLibrary::ResolveFunction(const std::string& name,
                                    UdfResolveContext* ctx,
                                    node::FnDefNode** result) const {
     std::string canonical_name = GetCanonicalName(name);
-    auto iter = table_.find(canonical_name);
-    CHECK_TRUE(iter != table_.end(), kCodegenError,
-               "Fail to find registered function: ", canonical_name);
-    auto& signature_table = iter->second->signature_table;
+    std::shared_ptr<UdfLibraryEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto iter = table_.find(canonical_name);
+        CHECK_TRUE(iter != table_.end(), kCodegenError,
+                   "Fail to find registered function: ", canonical_name);
+        entry = iter->second;
+    }
+    auto& signature_table = entry->signature_table;
 
     std::shared_ptr<UdfRegistry> registry = nullptr;
     std::string signature;
@@ -294,7 +409,7 @@ Status UdfLibrary::ResolveFunction(const std::string& name,
         ctx->GetArgSignature(), ">");
 
     DLOG(INFO) << "Resolve '" << canonical_name << "'<"
-               << ctx->GetArgSignature() << ">to " << canonical_name << "("
+               << ctx->GetArgSignature() << "> to " << canonical_name << "("
                << signature << ")";
     CHECK_TRUE(registry != nullptr, kCodegenError);
     return registry->ResolveFunction(ctx, result);
@@ -309,10 +424,14 @@ Status UdfLibrary::ResolveFunction(const std::string& name,
 }
 
 void UdfLibrary::AddExternalFunction(const std::string& name, void* addr) {
-    external_symbols_.insert(std::make_pair(name, addr));
+    std::lock_guard<std::mutex> lock(mu_);
+    if (external_symbols_.emplace(name, addr).first->second != addr) {
+        LOG(WARNING) << "ambiguous external function: " << name;
+    }
 }
 
 void UdfLibrary::InitJITSymbols(vm::HybridSeJitWrapper* jit_ptr) {
+    std::lock_guard<std::mutex> lock(mu_);
     for (auto& pair : external_symbols_) {
         jit_ptr->AddExternalFunction(pair.first, pair.second);
     }

@@ -20,17 +20,24 @@
 #include <vector>
 
 #include "node/node_manager.h"
-#include "udf/udf.h"
 #include "zetasql/parser/parser.h"
 
 namespace hybridse {
 namespace plan {
-base::Status ConvertASTType(const zetasql::ASTType* ast_type, node::NodeManager* node_manager, node::DataType* output);
+// ======================================================================================= //
+//                Public Interface
+// ======================================================================================= //
+base::Status ConvertASTScript(const zetasql::ASTScript* body, node::NodeManager* node_manager,
+                              node::SqlNodeList** output);
+base::Status ConvertStatement(const zetasql::ASTStatement* stmt, node::NodeManager* node_manager,
+                              node::SqlNode** output);
+
+// ======================================================================================= //
+// all interfaces below not consider public, which might moved later
+// ======================================================================================= //
 base::Status ConvertExprNode(const zetasql::ASTExpression* ast_expression, node::NodeManager* node_manager,
                              node::ExprNode** output);
 
-base::Status ConvertStatement(const zetasql::ASTStatement* stmt, node::NodeManager* node_manager,
-                              node::SqlNode** output);
 
 base::Status ConvertOrderBy(const zetasql::ASTOrderBy* order_by, node::NodeManager* node_manager,
                             node::OrderByNode** output);
@@ -59,6 +66,18 @@ base::Status ConvertInExpr(const zetasql::ASTInExpression* in_expr, node::NodeMa
 base::Status ConvertLimitOffsetNode(const zetasql::ASTLimitOffset* limit_offset, node::NodeManager* node_manager,
                                     node::SqlNode** output);
 
+base::Status ConvertCreateUserStatement(const zetasql::ASTCreateUserStatement* root, node::NodeManager* node_manager,
+                                        node::CreateUserNode** output);
+
+base::Status ConvertAlterUserStatement(const zetasql::ASTAlterUserStatement* root, node::NodeManager* node_manager,
+                                        node::AlterUserNode** output);
+
+base::Status ConvertGrantStatement(const zetasql::ASTGrantStatement* root, node::NodeManager* node_manager,
+                                   node::GrantNode** output);
+
+base::Status ConvertRevokeStatement(const zetasql::ASTRevokeStatement* root, node::NodeManager* node_manager,
+                                    node::RevokeNode** output);
+
 base::Status ConvertQueryNode(const zetasql::ASTQuery* root, node::NodeManager* node_manager, node::QueryNode** output);
 
 base::Status ConvertQueryExpr(const zetasql::ASTQueryExpression* query_expr, node::NodeManager* node_manager,
@@ -71,11 +90,12 @@ base::Status ConvertCreateTableNode(const zetasql::ASTCreateTableStatement* ast_
 base::Status ConvertCreateProcedureNode(const zetasql::ASTCreateProcedureStatement* ast_create_sp_stmt,
                                         node::NodeManager* node_manager, node::CreateSpStmt** output);
 
+base::Status ConvertCreateFunctionNode(const zetasql::ASTCreateFunctionStatement* ast_create_fun_stmt,
+                                        node::NodeManager* node_manager, node::CreateFunctionNode** output);
+
 base::Status ConvertParamter(const zetasql::ASTFunctionParameter* params, node::NodeManager* node_manager,
                              node::SqlNode** output);
 
-base::Status ConvertASTScript(const zetasql::ASTScript* body, node::NodeManager* node_manager,
-                              node::SqlNodeList** output);
 base::Status ConvertProcedureBody(const zetasql::ASTScript* body, node::NodeManager* node_manager,
                                   node::SqlNodeList** output);
 /// transform zetasql::ASTTableElement into corresponding SqlNode
@@ -92,6 +112,9 @@ base::Status ConvertIndexOption(const zetasql::ASTOptionsEntry* entry, node::Nod
 base::Status ConvertTableOption(const zetasql::ASTOptionsEntry* entry, node::NodeManager* node_manager,
                                 node::SqlNode** output);
 
+base::Status ConvertWithClause(const zetasql::ASTWithClause* with_clause, node::NodeManager* nm,
+                               base::BaseList<node::WithClauseEntry>* out);
+
 // utility function
 base::Status AstStringLiteralToString(const zetasql::ASTExpression* ast_expr, std::string* str);
 base::Status AstPathExpressionToString(const zetasql::ASTPathExpression* ast_expr, std::string* str);
@@ -101,6 +124,8 @@ base::Status AstPathExpressionToStringList(const zetasql::ASTPathExpression* ast
 base::Status ASTIntLiteralToNum(const zetasql::ASTExpression* ast_expr, int64_t* val);
 base::Status ASTIntervalLIteralToNum(const zetasql::ASTExpression* ast_expr, int64_t* val, node::DataType* unit);
 
+base::Status ConvertDeleteNode(const zetasql::ASTDeleteStatement* root, node::NodeManager* node_manager,
+                                    node::DeleteNode** output);
 base::Status ConvertInsertStatement(const zetasql::ASTInsertStatement* root, node::NodeManager* node_manager,
                                     node::InsertStmt** output);
 base::Status ConvertDropStatement(const zetasql::ASTDropStatement* root, node::NodeManager* node_manager,
@@ -108,7 +133,7 @@ base::Status ConvertDropStatement(const zetasql::ASTDropStatement* root, node::N
 base::Status ConvertCreateIndexStatement(const zetasql::ASTCreateIndexStatement* root, node::NodeManager* node_manager,
                                          node::CreateIndexNode** output);
 base::Status ConvertAstOptionsListToMap(const zetasql::ASTOptionsList* options, node::NodeManager* node_manager,
-                                        std::shared_ptr<node::OptionsMap> options_map);
+                                        std::shared_ptr<node::OptionsMap> options_map, bool to_lower = false);
 base::Status ConvertTargetName(const zetasql::ASTTargetName* node, std::vector<absl::string_view>& names); // NOLINT
 }  // namespace plan
 }  // namespace hybridse

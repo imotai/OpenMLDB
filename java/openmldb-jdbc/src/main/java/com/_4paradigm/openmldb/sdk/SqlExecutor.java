@@ -21,17 +21,22 @@ import com._4paradigm.openmldb.jdbc.CallablePreparedStatement;
 import com._4paradigm.openmldb.proto.NS;
 
 import java.sql.PreparedStatement;
+import java.sql.Statement;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 
 public interface SqlExecutor {
+    @Deprecated
     boolean createDB(String db);
 
+    @Deprecated
     boolean dropDB(String db);
 
+    @Deprecated
     boolean executeDDL(String db, String sql);
 
+    @Deprecated
     boolean executeInsert(String db, String sql);
 
     boolean executeInsert(String db, String sql, SQLInsertRow row);
@@ -40,15 +45,23 @@ public interface SqlExecutor {
 
     TableReader getTableReader();
 
+    @Deprecated
     java.sql.ResultSet executeSQL(String db, String sql);
 
+    @Deprecated
     SQLInsertRow getInsertRow(String db, String sql);
 
+    @Deprecated
     SQLInsertRows getInsertRows(String db, String sql);
 
+    @Deprecated
     ResultSet executeSQLRequest(String db, String sql, SQLRequestRow row);
 
+    Statement getStatement();
+
     PreparedStatement getInsertPreparedStmt(String db, String sql) throws SQLException;
+
+    PreparedStatement getDeletePreparedStmt(String db, String sql) throws SQLException;
 
     PreparedStatement getRequestPreparedStmt(String db, String sql) throws SQLException;
 
@@ -57,9 +70,9 @@ public interface SqlExecutor {
     PreparedStatement getBatchRequestPreparedStmt(String db, String sql,
                                                   List<Integer> commonColumnIndices) throws SQLException;
 
-    CallablePreparedStatement getCallablePreparedStmt(String db, String spName) throws SQLException;
+    CallablePreparedStatement getCallablePreparedStmt(String db, String deploymentName) throws SQLException;
 
-    CallablePreparedStatement getCallablePreparedStmtBatch(String db, String spName) throws SQLException;
+    CallablePreparedStatement getCallablePreparedStmtBatch(String db, String deploymentName) throws SQLException;
 
     Schema getInputSchema(String dbName, String sql) throws SQLException;
 
@@ -67,7 +80,16 @@ public interface SqlExecutor {
 
     ProcedureInfo showProcedure(String dbName, String proName) throws SQLException;
 
-    NS.TableInfo getTableInfo(String db, String table) throws SQLException;
+    NS.TableInfo getTableInfo(String db, String table);
+
+    List<String> getTableNames(String db);
+    /**
+     * Parse SQL query into DAG representation
+     *
+     * @param query SQL query string
+     * @throws SQLException exception if input query not valid for SQL parser
+     */
+    DAGNode SQLToDAG(String query) throws SQLException;
 
     void close();
 }

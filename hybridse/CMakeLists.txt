@@ -46,11 +46,9 @@ option(EXAMPLES_TESTING_ENABLE "Enable Examples Test" ON)
 option(BENCHMARK_ENABLE "Enable Benchmark" OFF)
 option(EXAMPLES_ENABLE "Enable examples" ON)
 option(LLVM_EXT_ENABLE "Enable llvm ext sources" OFF)
-option(SANITIZER_ENABLE "Enable AddressSanitizer in Debug mode" OFF)
 
-set(DEPS_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/.deps/usr" CACHE PATH "Path prefix for finding dependencies")
 if (NOT DEFINED CMAKE_PREFIX_PATH)
-    set(CMAKE_PREFIX_PATH ${DEPS_PREFIX})
+    set(CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/.deps/usr")
 endif()
 
 if (CMAKE_BUILD_TYPE STREQUAL "")
@@ -63,13 +61,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if (SANITIZER_ENABLE)
-    set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
-    set (CMAKE_LINKER_FLAGS_DEBUG "${CMAKE_LINKER_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
-    message(STATUS "Enabled AddressSanitizer")
-endif()
-
-set(SWIG_DIR ${CMAKE_PREFIX_PATH}/share/swig/4.0.1)
 # llvm dependency
 if (NOT DEFINED LLVM_DIR)
     set(LLVM_DIR "${CMAKE_PREFIX_PATH}/lib/cmake/llvm")
@@ -86,16 +77,30 @@ else ()
     llvm_map_components_to_libnames(LLVM_LIBS
             support core orcjit nativecodegen)
 endif ()
+message(STATUS "Using LLVM components: ${LLVM_LIBS}")
 
 find_package(Threads)
 
 set(Boost_NO_BOOST_CMAKE ON)
 set(BOOST_ROOT "${CMAKE_PREFIX_PATH}")
 find_package(Boost COMPONENTS filesystem date_time regex REQUIRED)
+find_package(OpenSSL REQUIRED)
+
+set(Protobuf_USE_STATIC_LIBS ON)
+find_package(Protobuf 3.6 EXACT REQUIRED)
+message(STATUS "Found Protobuf Libraries: ${Protobuf_LIBRARIES}")
+
+find_library(UNWIND_LIBRARY unwind)
+find_library(LEVELDB_LIBRARY leveldb)
+find_library(Z_LIBRARY z)
+find_library(SNAPPY_LIBRARY snappy)
+
+message(STATUS "Boost libraries ${Boost_LIBRARIES}")
+message(STATUS "OpenSSL libraries ${OPENSSL_LIBRARIES}")
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(OS_LIB ${CMAKE_THREAD_LIBS_INIT} rt)
-    set(COMMON_LIBS ${Boost_LIBRARIES} leveldb protobuf glog unwind z snappy ssl crypto dl)
-    set(BRPC_LIBS brpc ${COMMON_LIBS})
+    set(COMMON_LIBS ${Boost_LIBRARIES} ${LEVELDB_LIBRARY} ${Protobuf_LIBRARIES} ${GLOG_LIBRARY} ${UNWIND_LIBRARY} ${Z_LIBRARY} ${SNAPPY_LIBRARY} ${OPENSSL_LIBRARIES} ${GFLAGS_LIBRARY} dl)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(OS_LIB
             ${CMAKE_THREAD_LIBS_INIT}
@@ -108,14 +113,24 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
             "-Wl,-U,_MallocExtension_ReleaseFreeMemory"
             "-Wl,-U,_ProfilerStart"
             "-Wl,-U,_ProfilerStop")
-    set(COMMON_LIBS ${Boost_LIBRARIES} leveldb protobuf glog z snappy ssl crypto dl)
-    set(BRPC_LIBS brpc ${COMMON_LIBS})
+    set(COMMON_LIBS ${Boost_LIBRARIES} ${LEVELDB_LIBRARY} ${Protobuf_LIBRARIES} ${GLOG_LIBRARY} ${Z_LIBRARY} ${SNAPPY_LIBRARY} ${OPENSSL_LIBRARIES} ${GFLAGS_LIBRARY} dl)
 endif ()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9.1")
+    # GNU implementation prior to 9.1 requires linking with -lstdc++fs
+    list(APPEND COMMON_LIBS stdc++fs)
+endif()
 
 configure_file(
         "${PROJECT_SOURCE_DIR}/src/version.h.in"
         "${PROJECT_SOURCE_DIR}/src/hybridse_version.h"
 )
+
+configure_file(
+        "${PROJECT_SOURCE_DIR}/src/case/test_cfg.h.in"
+        "${PROJECT_SOURCE_DIR}/src/case/test_cfg.h"
+)
+
 if (DEFINED ENV{CI})
   # suppress useless maven log (e.g download log) on CI environment
   set(MAVEN_FLAGS --batch-mode)
@@ -152,14 +167,31 @@ set(yaml_libs yaml-cpp)
 
 add_definitions('-g')
 add_definitions(${LLVM_DEFINITIONS})
-find_package(SWIG REQUIRED)
-include(UseSWIG)
 
-include_directories(${CMAKE_PREFIX_PATH}/include)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-link_directories(${CMAKE_PREFIX_PATH}/lib)
-link_directories(${CMAKE_PREFIX_PATH}/lib64)
+# parent project may already found swig, skip if so.
+# the check is added because the find may failed on cmake < 3.20
+if (NOT SWIG_FOUND)
+    set(SWIG_DIR ${CMAKE_PREFIX_PATH}/share/swig/4.0.1)
+    find_package(SWIG REQUIRED)
+    include(UseSWIG)
+else()
+    message(STATUS "SWIG already found: ${SWIG_EXECUTABLE}:${SWIG_VERSION}")
+endif()
 
+include_directories(
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+    ${Boost_INCLUDE_DIRS}
+    ${CMAKE_PREFIX_PATH}/include
+    ${farmhash_SOURCE_DIR}/src
+)
+
+link_directories(
+    ${LLVM_LIBRARY_DIRS}
+    ${Boost_LIBRARY_DIRS}
+    ${CMAKE_PREFIX_PATH}/lib
+    ${CMAKE_PREFIX_PATH}/lib64)
 
 find_package(absl REQUIRED)
 # modify absl::time_zone INTERFACE_LINK_LIBRARIES
@@ -167,8 +199,6 @@ set_target_properties(absl::time_zone PROPERTIES INTERFACE_LINK_LIBRARIES "\$<\$
 
 find_package(GTest REQUIRED)
 
-set(Protobuf_USE_STATIC_LIBS ON)
-find_package(Protobuf 3.6 EXACT REQUIRED)
 list(
         APPEND
         ABSL_LIBS
@@ -188,6 +218,7 @@ list(
         absl::synchronization
         absl::time
         absl::status
+        absl::statusor
 )
 
 find_package(ICU COMPONENTS i18n io uc data)

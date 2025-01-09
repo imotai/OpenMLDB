@@ -21,11 +21,13 @@
 #include <unistd.h>
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "auth/brpc_authenticator.h"
 #include "base/file_util.h"
-#include "base/glog_wapper.h"
+#include "base/glog_wrapper.h"
 #include "brpc/server.h"
 #include "client/ns_client.h"
 #include "common/timer.h"
@@ -38,6 +40,7 @@
 #include "rpc/rpc_client.h"
 #include "sdk/db_sdk.h"
 #include "tablet/tablet_impl.h"
+#include "test/util.h"
 
 DECLARE_string(endpoint);
 DECLARE_string(tablet);
@@ -52,6 +55,8 @@ DECLARE_uint32(name_server_task_max_concurrency);
 DECLARE_bool(auto_failover);
 DECLARE_bool(enable_distsql);
 DECLARE_uint32(system_table_replica_num);
+DECLARE_uint32(get_table_diskused_interval);
+DECLARE_uint32(sync_deploy_stats_timeout);
 
 namespace openmldb {
 namespace sdk {
@@ -63,15 +68,43 @@ constexpr int MAX_TABLET_NUM = 3;
 class MiniCluster {
  public:
     explicit MiniCluster(int32_t zk_port)
-        : zk_port_(zk_port), ns_(), tablet_num_(2), zk_cluster_(), zk_path_(), ns_client_(NULL) {}
-    ~MiniCluster() = default;
+        : zk_port_(zk_port), ns_(), tablet_num_(2), zk_cluster_(), zk_path_(), ns_client_(NULL) {
+        FLAGS_skip_grant_tables = false;
+    }
+
+    ~MiniCluster() {
+        for (auto& tablet_authenticator : tablet_authenticators_) {
+            if (tablet_authenticator) {
+                delete tablet_authenticator;
+                tablet_authenticator = nullptr;
+            }
+        }
+
+        if (ns_authenticator_) {
+            delete ns_authenticator_;
+            ns_authenticator_ = nullptr;
+        }
+
+        for (const auto& kv : tb_clients_) {
+            delete kv.second;
+        }
+
+        if (ns_client_) {
+            delete ns_client_;
+        }
+        FLAGS_skip_grant_tables = true;
+    }
+
     bool SetUp(int tablet_num = 2) {
+        LOG(INFO) << "start tablet number " << tablet_num;
         if (tablet_num > MAX_TABLET_NUM) {
             return false;
         }
-        FLAGS_system_table_replica_num = 0;
+        FLAGS_system_table_replica_num = 1;
+        // lower diskused pull interval needed by SHOW TABLE STATUS tests
+        FLAGS_get_table_diskused_interval = 2000;
+        FLAGS_sync_deploy_stats_timeout = 2000;
         srand(time(NULL));
-        FLAGS_db_root_path = "/tmp/mini_cluster" + GenRand();
         zk_cluster_ = "127.0.0.1:" + std::to_string(zk_port_);
         FLAGS_zk_cluster = zk_cluster_;
         std::string ns_endpoint = "127.0.0.1:" + GenRand();
@@ -79,17 +112,31 @@ class MiniCluster {
         sleep(1);
         LOG(INFO) << "zk cluster " << zk_cluster_ << " zk path " << zk_path_
                   << " enable_distsql = " << FLAGS_enable_distsql;
-        ::openmldb::nameserver::NameServerImpl* nameserver = new ::openmldb::nameserver::NameServerImpl();
+        tablet_num_ = tablet_num;
+        for (int i = 0; i < tablet_num; i++) {
+            if (!StartTablet(&tb_servers_[i])) {
+                LOG(WARNING) << "fail to start tablet";
+                return false;
+            }
+        }
+        sleep(4);
+        nameserver = new ::openmldb::nameserver::NameServerImpl();
         bool ok = nameserver->Init(zk_cluster_, zk_path_, ns_endpoint, "");
         if (!ok) {
             return false;
         }
+        ns_authenticator_ = new openmldb::authn::BRPCAuthenticator(
+            [this](const std::string& host, const std::string& username, const std::string& password) {
+                return nameserver->IsAuthenticated(host, username, password);
+            });
         brpc::ServerOptions options;
-        if (ns_.AddService(nameserver, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-            LOG(WARNING) << "fail to start ns";
+        options.auth = ns_authenticator_;
+        if (ns_.AddService(nameserver, brpc::SERVER_OWNS_SERVICE) != 0) {
+            LOG(WARNING) << "fail to add ns";
             return false;
         }
         if (ns_.Start(ns_endpoint.c_str(), &options) != 0) {
+            LOG(WARNING) << "fail to start ns";
             return false;
         }
         sleep(2);
@@ -98,13 +145,7 @@ class MiniCluster {
             LOG(WARNING) << "fail to init ns client";
             return false;
         }
-        tablet_num_ = tablet_num;
-        for (int i = 0; i < tablet_num; i++) {
-            if (!StartTablet(&tb_servers_[i])) {
-                LOG(WARNING) << "fail to start tablet";
-                return false;
-            }
-        }
+        ns_endpoint_ = ns_endpoint;
         LOG(INFO) << "start mini cluster with zk cluster " << zk_cluster_ << " and zk path " << zk_path_;
         LOG(INFO) << "----- ns " << ns_endpoint;
         for (auto tb_endpoint : tb_endpoints_) {
@@ -114,12 +155,23 @@ class MiniCluster {
     }
 
     void Close() {
+        for (auto& tablet_authenticator : tablet_authenticators_) {
+            if (tablet_authenticator) {
+                delete tablet_authenticator;
+                tablet_authenticator = nullptr;
+            }
+        }
+        if (ns_authenticator_) {
+            delete ns_authenticator_;
+            ns_authenticator_ = nullptr;
+        }
+        nameserver->CloseThreadpool();
         ns_.Stop(10);
+        ns_.Join();
+
         for (int i = 0; i < tablet_num_; i++) {
             tb_servers_[i].Stop(10);
-        }
-        for (const auto& kv : tb_clients_) {
-            delete kv.second;
+            tb_servers_[i].Join();
         }
     }
 
@@ -151,6 +203,8 @@ class MiniCluster {
 
     const std::vector<std::string>& GetTbEndpoint() const { return tb_endpoints_; }
 
+    const std::string& GetNsEndpoint() const { return ns_endpoint_; }
+
  private:
     bool StartTablet(brpc::Server* tb_server) {
         std::string tb_endpoint = "127.0.0.1:" + GenRand();
@@ -160,18 +214,28 @@ class MiniCluster {
         if (!ok) {
             return false;
         }
-        brpc::ServerOptions ts_opt;
-        if (tb_server->AddService(tablet, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-            LOG(WARNING) << "fail to start tablet";
+
+        auto ts_authenticator = new openmldb::authn::BRPCAuthenticator(
+            [tablet](const std::string& host, const std::string& username, const std::string& password) {
+                return tablet->IsAuthenticated(host, username, password);
+            });
+        tablet_authenticators_.push_back(ts_authenticator);
+        brpc::ServerOptions options;
+        options.auth = ts_authenticator;
+
+        if (tb_server->AddService(tablet, brpc::SERVER_OWNS_SERVICE) != 0) {
+            LOG(WARNING) << "fail to add tablet";
             return false;
         }
-        if (tb_server->Start(tb_endpoint.c_str(), &ts_opt) != 0) {
+        if (tb_server->Start(tb_endpoint.c_str(), &options) != 0) {
+            LOG(WARNING) << "fail to start tablet";
             return false;
         }
         ok = tablet->RegisterZK();
         if (!ok) {
             return false;
         }
+        LOG(INFO) << "start tablet " << tb_endpoint;
         tablets_.emplace(tb_endpoint, tablet);
         sleep(2);
         auto* client = new ::openmldb::client::TabletClient(tb_endpoint, tb_endpoint);
@@ -182,45 +246,79 @@ class MiniCluster {
         tb_clients_.emplace(tb_endpoint, client);
         return true;
     }
-
+    ::openmldb::nameserver::NameServerImpl* nameserver;
     int32_t zk_port_;
     brpc::Server ns_;
     int32_t tablet_num_;
     brpc::Server tb_servers_[MAX_TABLET_NUM];
+    std::string ns_endpoint_;
     std::vector<std::string> tb_endpoints_;
     std::string zk_cluster_;
     std::string zk_path_;
     ::openmldb::client::NsClient* ns_client_;
     std::map<std::string, ::openmldb::tablet::TabletImpl*> tablets_;
     std::map<std::string, ::openmldb::client::TabletClient*> tb_clients_;
+    openmldb::authn::BRPCAuthenticator* ns_authenticator_;
+    std::vector<openmldb::authn::BRPCAuthenticator*> tablet_authenticators_;
 };
 
 class StandaloneEnv {
  public:
-    StandaloneEnv() : ns_(), ns_client_(nullptr), tb_client_(nullptr) {}
-    ~StandaloneEnv() = default;
+    StandaloneEnv() : ns_(), ns_client_(nullptr), tb_client_(nullptr) { FLAGS_skip_grant_tables = false; }
+    ~StandaloneEnv() {
+        for (auto& tablet_authenticator : tablet_authenticators_) {
+            if (tablet_authenticator) {
+                delete tablet_authenticator;
+                tablet_authenticator = nullptr;
+            }
+        }
+
+        if (ns_authenticator_) {
+            delete ns_authenticator_;
+            ns_authenticator_ = nullptr;
+        }
+        if (tb_client_) {
+            delete tb_client_;
+        }
+        if (ns_client_) {
+            delete ns_client_;
+        }
+        FLAGS_skip_grant_tables = true;
+    }
+
     bool SetUp() {
         srand(time(nullptr));
-        FLAGS_db_root_path = "/tmp/mini_cluster" + std::to_string(GenRand());
+        // shit happens, cluster & standalone require distinct db_root_path
+        test::TempPath tmp;
+        FLAGS_db_root_path = tmp.GetTempPath();
         if (!StartTablet(&tb_server_)) {
             LOG(WARNING) << "fail to start tablet";
             return false;
         }
         sleep(1);
         FLAGS_tablet = tb_endpoint_;
+        // lower diskused pull interval needed by SHOW TABLE STATUS tests
+        FLAGS_get_table_diskused_interval = 2000;
+        FLAGS_sync_deploy_stats_timeout = 2000;
         ns_port_ = GenRand();
         std::string ns_endpoint = "127.0.0.1:" + std::to_string(ns_port_);
-        ::openmldb::nameserver::NameServerImpl* nameserver = new ::openmldb::nameserver::NameServerImpl();
+        nameserver = new ::openmldb::nameserver::NameServerImpl();
         bool ok = nameserver->Init("", "", ns_endpoint, "");
         if (!ok) {
             return false;
         }
+        ns_authenticator_ = new openmldb::authn::BRPCAuthenticator(
+            [this](const std::string& host, const std::string& username, const std::string& password) {
+                return nameserver->IsAuthenticated(host, username, password);
+            });
         brpc::ServerOptions options;
-        if (ns_.AddService(nameserver, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-            LOG(WARNING) << "fail to start ns";
+        options.auth = ns_authenticator_;
+        if (ns_.AddService(nameserver, brpc::SERVER_OWNS_SERVICE) != 0) {
+            LOG(WARNING) << "fail to add ns";
             return false;
         }
         if (ns_.Start(ns_endpoint.c_str(), &options) != 0) {
+            LOG(WARNING) << "fail to start ns";
             return false;
         }
         sleep(2);
@@ -229,6 +327,7 @@ class StandaloneEnv {
             LOG(WARNING) << "fail to init ns client";
             return false;
         }
+        ns_endpoint_ = ns_endpoint;
         LOG(INFO) << "start standalone env";
         LOG(INFO) << "----- ns " << ns_endpoint;
         LOG(INFO) << "----- tb " << tb_endpoint_;
@@ -236,20 +335,33 @@ class StandaloneEnv {
     }
 
     void Close() {
+        for (auto& tablet_authenticator : tablet_authenticators_) {
+            if (tablet_authenticator) {
+                delete tablet_authenticator;
+                tablet_authenticator = nullptr;
+            }
+        }
+
+        if (ns_authenticator_) {
+            delete ns_authenticator_;
+            ns_authenticator_ = nullptr;
+        }
+        nameserver->CloseThreadpool();
         ns_.Stop(10);
+        ns_.Join();
         tb_server_.Stop(10);
-        delete tb_client_;
+        tb_server_.Join();
     }
 
     ::openmldb::client::NsClient* GetNsClient() { return ns_client_; }
 
-    ::openmldb::client::TabletClient* GetTabletClient() {
-        return tb_client_;
-    }
+    ::openmldb::client::TabletClient* GetTabletClient() { return tb_client_; }
 
     uint64_t GetNsPort() const { return ns_port_; }
 
     const std::string& GetTbEndpoint() const { return tb_endpoint_; }
+
+    const std::string& GetNsEndpoint() const { return ns_endpoint_; }
 
  private:
     uint64_t GenRand() { return rand() % 1000 + 10000; }
@@ -261,13 +373,21 @@ class StandaloneEnv {
         bool ok = tablet->Init("", "", tb_endpoint, "");
         if (!ok) {
             return false;
-        }
-        brpc::ServerOptions ts_opt;
-        if (tb_server->AddService(tablet, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-            LOG(WARNING) << "fail to start tablet";
+    }
+
+        auto ts_authenticator = new openmldb::authn::BRPCAuthenticator(
+            [tablet](const std::string& host, const std::string& username, const std::string& password) {
+                return tablet->IsAuthenticated(host, username, password);
+            });
+        tablet_authenticators_.push_back(ts_authenticator);
+        brpc::ServerOptions options;
+        options.auth = ts_authenticator;
+        if (tb_server->AddService(tablet, brpc::SERVER_OWNS_SERVICE) != 0) {
+            LOG(WARNING) << "fail to add tablet";
             return false;
         }
-        if (tb_server->Start(tb_endpoint.c_str(), &ts_opt) != 0) {
+        if (tb_server->Start(tb_endpoint.c_str(), &options) != 0) {
+            LOG(WARNING) << "fail to start tablet";
             return false;
         }
         sleep(2);
@@ -279,13 +399,16 @@ class StandaloneEnv {
         tb_client_ = client;
         return true;
     }
-
+    ::openmldb::nameserver::NameServerImpl* nameserver;
     brpc::Server ns_;
     brpc::Server tb_server_;
+    std::string ns_endpoint_;
     std::string tb_endpoint_;
     uint64_t ns_port_ = 0;
     ::openmldb::client::NsClient* ns_client_;
     ::openmldb::client::TabletClient* tb_client_;
+    openmldb::authn::BRPCAuthenticator* ns_authenticator_;
+    std::vector<openmldb::authn::BRPCAuthenticator*> tablet_authenticators_;
 };
 
 }  // namespace sdk

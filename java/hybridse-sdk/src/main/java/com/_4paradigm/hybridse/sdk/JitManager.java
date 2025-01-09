@@ -16,7 +16,6 @@
 
 package com._4paradigm.hybridse.sdk;
 
-import com._4paradigm.hybridse.HybridSeLibrary;
 import com._4paradigm.hybridse.vm.Engine;
 import com._4paradigm.hybridse.vm.HybridSeJitWrapper;
 import com._4paradigm.hybridse.vm.JitOptions;
@@ -55,7 +54,6 @@ public class JitManager {
             if(!jit.Init()){
                 throw new RuntimeException("Fail to init jit");
             }
-            HybridSeJitWrapper.InitJitSymbols(jit);
             jits.put(tag, jit);
         }
         return jits.get(tag);
@@ -116,11 +114,12 @@ public class JitManager {
      * @param tag tag specified a jit
      * @param moduleBuffer ByteBuffer used to initialize native module
      */
-    public static synchronized void initJitModule(String tag, ByteBuffer moduleBuffer) {
+    public static synchronized void initJitModule(String tag, ByteBuffer moduleBuffer, boolean isUnsafeRowOpt) {
         // Notice that we should load library before calling this, invoke SqlClusterExecutor.initJavaSdkLibrary()
 
         // ensure worker native
         Engine.InitializeGlobalLLVM();
+        Engine.InitializeUnsafeRowOptFlag(isUnsafeRowOpt);
 
         // ensure worker side module
         if (!JitManager.hasModule(tag)) {
@@ -135,6 +134,8 @@ public class JitManager {
      * @param tag module tag
      */
     public static synchronized void removeModule(String tag) {
+        // HybridSeJitWrapper is a proxy class to C pointer, Java do not automatic
+        // lifetime of C pointer, so it must made explicitly
         initializedModuleTags.remove(tag);
         HybridSeJitWrapper jit = jits.remove(tag);
         if (jit != null) {

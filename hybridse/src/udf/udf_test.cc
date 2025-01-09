@@ -15,13 +15,17 @@
  */
 
 #include "udf/udf_test.h"
+
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <stdint.h>
+
 #include <algorithm>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include "absl/strings/substitute.h"
 #include "base/fe_slice.h"
 #include "case/sql_case.h"
 #include "codec/list_iterator_codec.h"
@@ -35,6 +39,8 @@ using hybridse::codec::ColumnImpl;
 using hybridse::codec::ListRef;
 using hybridse::codec::Row;
 using hybridse::sqlcase::SqlCase;
+using openmldb::base::Date;
+using openmldb::base::Timestamp;
 
 class UdfTest : public ::testing::Test {
  public:
@@ -467,7 +473,7 @@ TEST_F(UdfTest, GetColHeapTest) {
 TEST_F(UdfTest, DateToString) {
     {
         codec::StringRef str;
-        codec::Date date(2020, 5, 22);
+        Date date(2020, 5, 22);
         udf::v1::date_to_string(&date, &str);
         ASSERT_EQ(codec::StringRef("2020-05-22"), str);
     }
@@ -476,13 +482,13 @@ TEST_F(UdfTest, DateToString) {
 TEST_F(UdfTest, TimestampToString) {
     {
         codec::StringRef str;
-        codec::Timestamp ts(1590115420000L);
+        Timestamp ts(1590115420000L);
         udf::v1::timestamp_to_string(&ts, &str);
         ASSERT_EQ(codec::StringRef("2020-05-22 10:43:40"), str);
     }
     {
         codec::StringRef str;
-        codec::Timestamp ts(1590115421000L);
+        Timestamp ts(1590115421000L);
         udf::v1::timestamp_to_string(&ts, &str);
         ASSERT_EQ(codec::StringRef("2020-05-22 10:43:41"), str);
     }
@@ -521,7 +527,7 @@ class ExternUdfTest : public ::testing::Test {
         *output = is_null ? *default_val : *in;
     }
 
-    static void NewDate(int64_t in, bool is_null, codec::Date* out,
+    static void NewDate(int64_t in, bool is_null, Date* out,
                         bool* is_null_addr) {
         *is_null_addr = is_null;
         if (!is_null) {
@@ -568,10 +574,7 @@ TEST_F(ExternUdfTest, TestCompoundTypedExternalCall) {
     library.RegisterExternal("add_two_one_nullable")
         .args<Nullable<int32_t>, int32_t>(ExternUdfTest::AddTwoOneNullable);
 
-    library.RegisterExternal("new_date")
-        .args<Nullable<int64_t>>(
-            TypeAnnotatedFuncPtrImpl<std::tuple<Nullable<int64_t>>>::RBA<
-                Nullable<codec::Date>>(ExternUdfTest::NewDate));
+    library.RegisterExternal("new_date").args<Nullable<int64_t>>(ExternUdfTest::NewDate);
 
     library.RegisterExternal("sum_tuple")
         .args<Tuple<Nullable<float>, float>, Tuple<double, Nullable<double>>>(
@@ -579,12 +582,10 @@ TEST_F(ExternUdfTest, TestCompoundTypedExternalCall) {
         .args<Tuple<Nullable<float>, Tuple<float, double, Nullable<double>>>>(
             ExternUdfTest::SumTuple);
 
-    library.RegisterExternal("make_tuple")
-        .args<int16_t, Nullable<int32_t>, int64_t>(
-            TypeAnnotatedFuncPtrImpl<
-                std::tuple<int16_t, Nullable<int32_t>, int64_t>>::
-                RBA<Tuple<int16_t, Nullable<int32_t>, int64_t>>(
-                    ExternUdfTest::MakeTuple));
+    // no public interface to registering customized return type, disabling
+    // library.RegisterExternal("make_tuple")
+    //     .args<int16_t, Nullable<int32_t>, int64_t>(
+    //         TypeAnnotatedFuncPtrImpl<std::tuple<int16_t, Nullable<int32_t>, int64_t>>(ExternUdfTest::MakeTuple));
 
     // pass null to primitive
     CheckUdf<int32_t, Nullable<int32_t>, int32_t>(&library, "if_null", 1, 1, 3);
@@ -617,9 +618,9 @@ TEST_F(ExternUdfTest, TestCompoundTypedExternalCall) {
         &library, "add_two_one_nullable", nullptr, nullptr, nullptr);
 
     // nullable return
-    CheckUdf<Nullable<codec::Date>, Nullable<int64_t>>(&library, "new_date",
-                                                       codec::Date(1), 1);
-    CheckUdf<Nullable<codec::Date>, Nullable<int64_t>>(&library, "new_date",
+    CheckUdf<Nullable<Date>, Nullable<int64_t>>(&library, "new_date",
+                                                       Date(1), 1);
+    CheckUdf<Nullable<Date>, Nullable<int64_t>>(&library, "new_date",
                                                        nullptr, nullptr);
 
     // pass tuple
@@ -657,11 +658,11 @@ TEST_F(ExternUdfTest, TestCompoundTypedExternalCall) {
             1.0f, Tuple<Nullable<float>, double, double>(nullptr, 3.0, 4.0)));
 
     // return tuple
-    using TupleResT = Tuple<int16_t, Nullable<int32_t>, int64_t>;
-    CheckUdf<TupleResT, int16_t, Nullable<int32_t>, int64_t>(
-        &library, "make_tuple", TupleResT(1, 2, 3), 1, 2, 3);
-    CheckUdf<TupleResT, int16_t, Nullable<int32_t>, int64_t>(
-        &library, "make_tuple", TupleResT(1, nullptr, 3), 1, nullptr, 3);
+    // using TupleResT = Tuple<int16_t, Nullable<int32_t>, int64_t>;
+    // CheckUdf<TupleResT, int16_t, Nullable<int32_t>, int64_t>(
+    //     &library, "make_tuple", TupleResT(1, 2, 3), 1, 2, 3);
+    // CheckUdf<TupleResT, int16_t, Nullable<int32_t>, int64_t>(
+    //     &library, "make_tuple", TupleResT(1, nullptr, 3), 1, nullptr, 3);
 }
 
 TEST_F(ExternUdfTest, LikeMatchTest) {
@@ -878,6 +879,267 @@ TEST_F(ExternUdfTest, ILikeMatchNullable) {
 
     check_null(true, false, &name, &pattern, &escape_ref);
 }
+
+TEST_F(ExternUdfTest, RLikeMatchTest) {
+    auto check_rlike = [](bool match, bool is_null, const std::string_view name, const std::string_view pattern,
+                         const std::string_view flags) -> void {
+        codec::StringRef name_ref(name.size(), name.data());
+        codec::StringRef pattern_ref(pattern.size(), pattern.data());
+        codec::StringRef flags_ref(flags.size(), flags.data());
+        bool ret = false;
+        bool ret_null = false;
+        v1::regexp_like(&name_ref, &pattern_ref, &flags_ref, &ret, &ret_null);
+        EXPECT_EQ(match, ret) << "rlike(" << name << ", " << pattern << ", " << flags << ")";
+        EXPECT_EQ(is_null, ret_null) << "rlike(" << name << ", " << pattern << ", " << flags << ")";
+
+        if (flags == "") {
+            // also check regexp_like(x, x)
+            bool ret = false;
+            bool ret_null = false;
+            v1::regexp_like(&name_ref, &pattern_ref, &ret, &ret_null);
+            EXPECT_EQ(match, ret) << "rlike(" << name << ", " << pattern << ")";
+            EXPECT_EQ(is_null, ret_null) << "rlike(" << name << ", " << pattern << ")";
+        }
+    };
+
+    check_rlike(true, false, "The Lord of the Rings", "The Lord of the Rings", "");
+
+    // case sensitive
+    check_rlike(true, false, "The Lord of the Rings", "The L.rd .f the Rings", "");
+    check_rlike(false, false, "The Lord of the Rings", "the L.rd .f the Rings", "");
+
+    // match empty
+    check_rlike(true, false, "", "", "");
+    check_rlike(false, false, "The Lord of the Rings", "", "");
+    check_rlike(false, false, "", "The Lord of the Rings", "");
+
+    // single flag
+    check_rlike(false, false, "The Lord of the Rings", "the L.rd .f the Rings", "c");
+    check_rlike(true, false, "The Lord of the Rings", "the L.rd .f the Rings", "i");
+
+    check_rlike(false, false, "The Lord of the Rings\nJ. R. R. Tolkien",
+                "The Lord of the Rings.J\\. R\\. R\\. Tolkien", "");
+    check_rlike(true, false, "The Lord of the Rings\nJ. R. R. Tolkien",
+                "The Lord of the Rings.J\\. R\\. R\\. Tolkien", "s");
+
+    check_rlike(false, false, "The Lord of the Rings\nJ. R. R. Tolkien",
+                "^The Lord of the Rings$\nJ\\. R\\. R\\. Tolkien", "");
+    check_rlike(true, false, "The Lord of the Rings\nJ. R. R. Tolkien",
+                "^The Lord of the Rings$\nJ\\. R\\. R\\. Tolkien", "m");
+
+    // multiple flags
+    check_rlike(true, false, "The Lord of the Rings\nJ. R. R. Tolkien",
+                "^the Lord of the Rings$.J\\. R\\. R\\. Tolkien", "mis");
+}
+
+TEST_F(ExternUdfTest, RLikeMatchNullable) {
+    auto check_null = [](bool expect, bool is_null, codec::StringRef* name_ref, codec::StringRef* pattern_ref,
+                         codec::StringRef* flags) -> void {
+        bool ret = false;
+        bool ret_null = false;
+        v1::regexp_like(name_ref, pattern_ref, flags, &ret, &ret_null);
+        EXPECT_EQ(is_null, ret_null) << (name_ref ? name_ref->ToString() : "<null>") << " RLIKE "
+                                     << (pattern_ref ? pattern_ref->ToString() : "<null>") << " FLAGS "
+                                     << (flags ? flags->ToString() : "<null>");
+        if (!is_null) {
+            EXPECT_EQ(expect, ret) << (name_ref ? name_ref->ToString() : "<null>") << " RLIKE "
+                                   << (pattern_ref ? pattern_ref->ToString() : "<null>") << " FLAGS "
+                                   << (flags ? flags->ToString() : "<null>");
+        }
+    };
+    char flags[] = "";
+    codec::StringRef flags_ref(flags);
+    codec::StringRef name("The Lord of the Rings");
+    codec::StringRef pattern("The Lord .f the Rings");
+
+    check_null(false, true, nullptr, &pattern, &flags_ref);
+    check_null(false, true, &name, nullptr, &flags_ref);
+    check_null(false, true, nullptr, nullptr, &flags_ref);
+
+    check_null(false, true, nullptr, &pattern, nullptr);
+    check_null(false, true, &name, nullptr, nullptr);
+    check_null(false, true, nullptr, nullptr, nullptr);
+    check_null(false, true, &name, &pattern, nullptr);
+
+    check_null(true, false, &name, &pattern, &flags_ref);
+}
+
+TEST_F(ExternUdfTest, Replace) {
+    auto check = [](bool is_null, StringRef expect, StringRef str, StringRef search, StringRef replace) {
+        StringRef out;
+        bool out_null = false;
+        auto expr_str = absl::Substitute("replace($0, $1, $2) != $3", str.DebugString(), search.DebugString(),
+                                         replace.DebugString(), expect.DebugString());
+        v1::replace(&str, &search, &replace, &out, &out_null);
+        EXPECT_EQ(is_null, out_null) << expr_str;
+        if (!is_null) {
+            EXPECT_EQ(expect, out) << expr_str;
+        }
+    };
+
+    // replace one
+    check(false, "ABCDEF", "ABCabc", "abc", "DEF");
+    // replace nothing
+    check(false, "ABCabc", "ABCabc", "def", "DEF");
+    // replace multiple chars
+    check(false, "AABACA", "AaBaCa", "a", "A");
+    // replace multiple words
+    check(false, "Hello Bob Hi Bob Be", "Hello Ben Hi Ben Be", "Ben", "Bob");
+
+    // empty replace removes the search
+    // replace one
+    check(false, "ABC", "ABCabc", "abc", "");
+    // replace nothing
+    check(false, "ABCabc", "ABCabc", "def", "");
+    // replace multiple chars
+    check(false, "ABC", "AaBaCa", "a", "");
+    // replace multiple words
+    check(false, "Hello  Hi  Be", "Hello Ben Hi Ben Be", "Ben", "");
+}
+
+TEST_F(ExternUdfTest, ReplaceWithoutReplaceStr) {
+    auto check = [](bool is_null, StringRef expect, StringRef str, StringRef search) {
+        StringRef out;
+        bool out_null = false;
+        auto expr_str =
+            absl::Substitute("replace($0, $1) != $2", str.DebugString(), search.DebugString(), expect.DebugString());
+        v1::replace(&str, &search, &out, &out_null);
+        EXPECT_EQ(is_null, out_null) << expr_str;
+        if (!is_null) {
+            EXPECT_EQ(expect, out) << expr_str;
+        }
+    };
+
+    // replace one
+    check(false, "ABC", "ABCabc", "abc");
+    // replace nothing
+    check(false, "ABCabc", "ABCabc", "def");
+    // replace multiple chars
+    check(false, "ABC", "AaBaCa", "a");
+    // replace multiple words
+    check(false, "Hello  Hi  Be", "Hello Ben Hi Ben Be", "Ben");
+}
+
+TEST_F(ExternUdfTest, ReplaceNullable) {
+    auto debug_str = [](StringRef* ref) -> std::string { return ref == nullptr ? "NULL" : ref->DebugString(); };
+    auto check3 = [&debug_str](bool is_null, StringRef expect, StringRef* str, StringRef* search, StringRef* replace) {
+        StringRef out;
+        bool out_null = false;
+        auto expr_str = absl::Substitute("replace($0, $1, $2) != $3", debug_str(str), debug_str(search),
+                                         debug_str(replace), expect.DebugString());
+        v1::replace(str, search, replace, &out, &out_null);
+        EXPECT_EQ(is_null, out_null) << expr_str;
+        if (!is_null) {
+            EXPECT_EQ(expect, out) << expr_str;
+        }
+    };
+
+    auto check2 = [&debug_str](bool is_null, StringRef expect, StringRef* str, StringRef* search) {
+        StringRef out;
+        bool out_null = false;
+        auto expr_str =
+            absl::Substitute("replace($0, $1) != $2", debug_str(str), debug_str(search), expect.DebugString());
+        v1::replace(str, search, &out, &out_null);
+        EXPECT_EQ(is_null, out_null) << expr_str;
+        if (!is_null) {
+            EXPECT_EQ(expect, out) << expr_str;
+        }
+    };
+
+    StringRef str("ABCabc");
+    StringRef search("abc");
+    StringRef replace("ABC");
+
+    check3(true, nullptr, nullptr, &search, &replace);
+    check3(true, nullptr, &str, nullptr, &replace);
+    check3(true, nullptr, &str, &search, nullptr);
+    check3(true, nullptr, &str, nullptr, nullptr);
+    check3(true, nullptr, nullptr, &search, nullptr);
+    check3(true, nullptr, nullptr, nullptr, nullptr);
+
+    check2(true, nullptr, &str, nullptr);
+    check2(true, nullptr, nullptr, &search);
+    check2(true, nullptr, nullptr, nullptr);
+}
+
+struct StrCastCase {
+    absl::string_view input;
+    enum class ErrType {
+        OK = 0,
+        INVALID,
+        OUT_OF_RANGE,
+        UNKOWN_ERR,
+    };
+    ErrType type;
+    int64_t expect;
+
+    friend std::ostream& operator<<(std::ostream& os, const StrCastCase& val) {
+        return os << "{input=" << val.input << ", expect=" << val.expect << ", status=" << static_cast<int>(val.type)
+                  << "}";
+    }
+};
+
+class CastTest : public ::testing::TestWithParam<StrCastCase> {};
+
+TEST_P(CastTest, StrCastI64) {
+    auto& cs = GetParam();
+    auto [s, ret] = v1::StrToIntegral()(cs.input);
+    switch (cs.type) {
+        case StrCastCase::ErrType::OK: {
+            EXPECT_TRUE(s.ok()) << s;
+            EXPECT_EQ(cs.expect, ret);
+            break;
+        }
+        case StrCastCase::ErrType::INVALID: {
+            EXPECT_TRUE(absl::IsInvalidArgument(s)) << s;
+            break;
+        }
+        case StrCastCase::ErrType::OUT_OF_RANGE: {
+            EXPECT_TRUE(absl::IsOutOfRange(s)) << s;
+            break;
+        }
+        case StrCastCase::ErrType::UNKOWN_ERR: {
+            EXPECT_TRUE(absl::IsUnknown(s)) << s;
+            break;
+        }
+    }
+}
+
+static const std::vector<StrCastCase>& GetCastCases() {
+    static const std::vector<StrCastCase> cs{
+        {"12", StrCastCase::ErrType::OK, 12},
+        {"012", StrCastCase::ErrType::OK, 12},
+        {"0", StrCastCase::ErrType::OK, 0},
+        {" 9", StrCastCase::ErrType::OK, 9},
+        {" +100 ", StrCastCase::ErrType::OK, 100},
+        {"-999\t", StrCastCase::ErrType::OK, -999},
+        {"+0", StrCastCase::ErrType::OK, 0},
+        {"-0", StrCastCase::ErrType::OK, 0},
+        {"-1", StrCastCase::ErrType::OK, -1},
+        {"-88", StrCastCase::ErrType::OK, -88},
+        {"0x12", StrCastCase::ErrType::OK, 18},
+        {"+0X2a", StrCastCase::ErrType::OK, 42},
+        {"-0X2b", StrCastCase::ErrType::OK, -43},
+        {"\t -0X2b", StrCastCase::ErrType::OK, -43},
+        {"9223372036854775807", StrCastCase::ErrType::OK, INT64_MAX},
+        {"0x7FFFFFFFFFFFFFFF", StrCastCase::ErrType::OK, INT64_MAX},
+        {"-9223372036854775808", StrCastCase::ErrType::OK, INT64_MIN},
+        {"", StrCastCase::ErrType::INVALID, {}},
+        {"-", StrCastCase::ErrType::INVALID, {}},
+        {"+", StrCastCase::ErrType::INVALID, {}},
+        {"8g", StrCastCase::ErrType::INVALID, {}},
+        {"0x12k", StrCastCase::ErrType::INVALID, {}},
+        {"8l", StrCastCase::ErrType::INVALID, {}},
+        {"8 l", StrCastCase::ErrType::INVALID, {}},
+        {"gg", StrCastCase::ErrType::INVALID, {}},
+        {"80x99", StrCastCase::ErrType::INVALID, {}},
+        {"89223372036854775807", StrCastCase::ErrType::OUT_OF_RANGE, {}},
+        {"-19223372036854775807", StrCastCase::ErrType::OUT_OF_RANGE, {}},
+    };
+    return cs;
+}
+
+INSTANTIATE_TEST_SUITE_P(CastI64, CastTest, ::testing::ValuesIn(GetCastCases()));
 
 }  // namespace udf
 }  // namespace hybridse

@@ -55,9 +55,10 @@ object GroupByAggregationPlan {
     val sortedInputDf = inputDf.sortWithinPartitions(groupByCols:_*)
 
     // Get schema info
-    val inputSchemaSlices = HybridseUtil.getOutputSchemaSlices(node.GetProducer(0))
+    val isUnsafeRowOpt = ctx.getConf.enableUnsafeRowOptimization
+    val inputSchemaSlices = HybridseUtil.getOutputSchemaSlices(node.GetProducer(0), isUnsafeRowOpt)
     val inputSchema = HybridseUtil.getSparkSchema(node.GetProducer(0).GetOutputSchema())
-    val outputSchemaSlices = HybridseUtil.getOutputSchemaSlices(node)
+    val outputSchemaSlices = HybridseUtil.getOutputSchemaSlices(node, isUnsafeRowOpt)
 
     val outputSchema = if (keepIndexColumn) {
       HybridseUtil.getSparkSchema(node.GetOutputSchema())
@@ -67,7 +68,7 @@ object GroupByAggregationPlan {
     }
 
     // Wrap Spark closure
-    val limitCnt = node.GetLimitCnt
+    val limitCnt = node.GetLimitCntValue
     val projectConfig = ProjectConfig(
       functionName = node.project().fn_info().fn_name(),
       moduleTag = ctx.getTag,
@@ -80,6 +81,7 @@ object GroupByAggregationPlan {
     val groupKeyComparator = HybridseUtil.createGroupKeyComparator(groupIdxs.toArray)
 
     val openmldbJsdkLibraryPath = ctx.getConf.openmldbJsdkLibraryPath
+    val isUnafeRowOpt = ctx.getConf.enableUnsafeRowOptimization
 
     // Map partition
     val resultRDD = sortedInputDf.rdd.mapPartitions(iter => {
@@ -92,7 +94,7 @@ object GroupByAggregationPlan {
         val tag = projectConfig.moduleTag
         val buffer = projectConfig.moduleNoneBroadcast.getBuffer
         SqlClusterExecutor.initJavaSdkLibrary(openmldbJsdkLibraryPath)
-        JitManager.initJitModule(tag, buffer)
+        JitManager.initJitModule(tag, buffer, isUnafeRowOpt)
 
         val jit = JitManager.getJit(tag)
         val fn = jit.FindFunction(projectConfig.functionName)
@@ -115,7 +117,7 @@ object GroupByAggregationPlan {
         val grouopNativeRows =  mutable.ArrayBuffer[NativeRow]()
 
         iter.foreach(row => {
-          if (limitCnt <= 0 || currentLimitCnt < limitCnt) { // Do not set limit or not reach the limit
+          if (limitCnt < 0 || currentLimitCnt < limitCnt) { // Do not set limit or not reach the limit
             if (lastRow != null) { // Ignore the first row in partition
               val groupChanged = groupKeyComparator.apply(row, lastRow)
               if (groupChanged) {
@@ -149,7 +151,7 @@ object GroupByAggregationPlan {
         })
 
         // Run group by for the last group
-        if (limitCnt <= 0 || currentLimitCnt < limitCnt) {
+        if (limitCnt < 0 || currentLimitCnt < limitCnt) {
           val outputHybridseRow = CoreAPI.GroupbyProject(fn, groupbyInterface)
           val outputArr = Array.fill[Any](outputFields)(null)
           decoder.decode(outputHybridseRow, outputArr)

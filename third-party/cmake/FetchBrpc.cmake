@@ -12,18 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set(BRPC_URL https://github.com/4paradigm/incubator-brpc/archive/c94030a1ecacfd0d5f9e2a0e9d05c816eef35ac8.zip)
-message(STATUS "build brpc from ${BRPC_URL}")
+set(BRPC_URL https://github.com/apache/brpc)
+set(BRPC_TAG d2b73ec955dd04b06ab55065d9f3b4de1e608bbd)
+message(STATUS "build brpc from ${BRPC_URL}@${BRPC_TAG}")
+
+find_package(Git REQUIRED)
 
 ExternalProject_Add(
   brpc
-  URL ${BRPC_URL}
-  URL_HASH SHA256=d981e36ebd54537c5f0d46367adb48886d660f3d7cecc6737817870554a8588b
+  GIT_REPOSITORY ${BRPC_URL}
+  GIT_TAG ${BRPC_TAG}
   PREFIX ${DEPS_BUILD_DIR}
   DOWNLOAD_DIR ${DEPS_DOWNLOAD_DIR}/brpc
   INSTALL_DIR ${DEPS_INSTALL_DIR}
+  PATCH_COMMAND ${GIT_EXECUTABLE} checkout .
+    COMMAND ${GIT_EXECUTABLE} clean -dfx .
+    COMMAND ${GIT_EXECUTABLE} apply ${PROJECT_SOURCE_DIR}/patches/brpc-1.6.0.patch
+    COMMAND ${GIT_EXECUTABLE} apply ${PROJECT_SOURCE_DIR}/patches/brpc-1.6.0-2235.patch
   DEPENDS gflags glog protobuf snappy leveldb gperf openssl
-  CONFIGURE_COMMAND ${CMAKE_COMMAND} -H<SOURCE_DIR> -B . -DWITH_GLOG=ON -DCMAKE_PREFIX_PATH=${DEPS_INSTALL_DIR} -DCMAKE_INSTALL_PREFIX=${DEPS_INSTALL_DIR} ${CMAKE_OPTS}
+  # BRPC get problemistic with CMAKE_BUILD_TYPE=Release (-O3), and seems to having its own
+  # CPP flags by default, so we do not inherit global CMAKE_OPTS variable
+  CONFIGURE_COMMAND
+    ${CMAKE_COMMAND} -H<SOURCE_DIR> -B . -DWITH_GLOG=ON
+    -DCMAKE_PREFIX_PATH=${DEPS_INSTALL_DIR} -DCMAKE_INSTALL_PREFIX=${DEPS_INSTALL_DIR}
   BUILD_COMMAND ${CMAKE_COMMAND} --build . --target brpc-static -- ${MAKEOPTS}
   INSTALL_COMMAND bash -c "cp -rvf output/include/* <INSTALL_DIR>/include/"
     COMMAND cp -v output/lib/libbrpc.a <INSTALL_DIR>/lib)

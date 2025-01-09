@@ -56,11 +56,6 @@ cases:
     desc: 表路径层级超过边界2
     sql: |
       select db.t1.level3.* from t;
-  - id: 9
-    desc: Insert 非常量
-    mode: request-unsupport
-    sql: |
-      insert into t1 values(1, 2, aaa);
   - id: in_predicate_subquery
     desc: test_expr in subquery
     sql: |
@@ -75,6 +70,9 @@ cases:
   - id: set_statement
     desc: unsupported value type
     sql: SET SELECT_MODE = 1 + 2;
+  - id: set_global_to_expr
+    desc: unsupported value type
+    sql: SET GLOBAL xxx = 1 + 1;
   - id: group_complex_expression
     desc: SELECT GROUP BY complex expression is unsupport
     sql: SELECT COL1+COL2 FROM t1 group by COL1+COL2;
@@ -93,10 +91,21 @@ cases:
     sql: |
       SELECT SUM(COL1), SUM(COL) over w1 FROM t1
       window as w1(partition by col0 order by col5 rows between 100 preceding and current row);
-  - id: delete_table
-    sql: |
-      delete from t1 where id = 12;
   - id: delete_job_2
     desc: abc here is not job id but alias
     sql: |
       delete job abc
+  - id: array_1
+    desc: array of array not support
+    sql: |
+      select ARRAY<ARRAY<INT>>[[1,2], [3, 4]] as col;
+    expect:
+      success: false
+      msg: 'array of non-basic type is not supported: ARRAY<ARRAY<INT32>>'
+  - id: 21
+    sql: |
+      insert into t1 values (29223372036854775807)
+    expect:
+      success: false
+      msg: |
+        Invalid integer literal<OUT_OF_RANGE: 29223372036854775807 (overflow)>

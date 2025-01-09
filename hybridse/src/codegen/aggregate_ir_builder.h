@@ -64,7 +64,7 @@ struct AggColumnInfo {
 
     size_t GetOutputNum() const { return output_idxs.size(); }
 
-    void Show() {
+    std::string DebugString() const {
         std::stringstream ss;
         ss << DataTypeName(col_type) << " " << GetColKey() << ": [";
         for (size_t i = 0; i < GetOutputNum(); ++i) {
@@ -73,7 +73,8 @@ struct AggColumnInfo {
                 ss << ", ";
             }
         }
-        ss << "]\n";
+        ss << "]";
+        return ss.str();
     }
 };
 
@@ -82,13 +83,8 @@ class AggregateIRBuilder {
     AggregateIRBuilder(const vm::SchemasContext*, ::llvm::Module* module,
                        const node::FrameNode* frame_node, uint32_t id);
 
-    // TODO(someone): remove temporary implementations for row-wise agg
-    static bool EnableColumnAggOpt();
-
     bool CollectAggColumn(const node::ExprNode* expr, size_t output_idx,
                           ::hybridse::type::Type* col_type);
-
-    bool IsAggFuncName(const std::string& fname);
 
     static llvm::Type* GetOutputLlvmType(
         ::llvm::LLVMContext& llvm_ctx,  // NOLINT
@@ -104,11 +100,14 @@ class AggregateIRBuilder {
     bool empty() const { return agg_col_infos_.empty(); }
 
  private:
+    bool IsAggFuncName(absl::string_view fname) const;
+
+    // schema context of input node
     const vm::SchemasContext* schema_context_;
+
     ::llvm::Module* module_;
     const node::FrameNode* frame_node_;
     uint32_t id_;
-    std::set<std::string> available_agg_func_set_;
     std::unordered_map<std::string, AggColumnInfo> agg_col_infos_;
 };
 

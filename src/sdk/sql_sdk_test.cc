@@ -23,15 +23,11 @@
 #include <string>
 #include <vector>
 
-#include "base/file_util.h"
-#include "base/glog_wapper.h"
-#include "codec/fe_row_codec.h"
-#include "common/timer.h"
+#include "base/glog_wrapper.h"
 #include "gflags/gflags.h"
 #include "sdk/mini_cluster.h"
 #include "sdk/sql_router.h"
-#include "test/base_test.h"
-#include "vm/catalog.h"
+#include "test/util.h"
 
 namespace openmldb {
 namespace sdk {
@@ -39,39 +35,42 @@ namespace sdk {
 MiniCluster* mc_ = nullptr;
 std::shared_ptr<SQLRouter> router_ = std::shared_ptr<SQLRouter>();
 
+static void SetOnlineMode(std::shared_ptr<SQLRouter> router) {
+    ::hybridse::sdk::Status status;
+    router->ExecuteSQL("SET @@execute_mode='online';", &status);
+    ASSERT_TRUE(status.IsOK()) << status.msg;
+}
 
 static std::shared_ptr<SQLRouter> GetNewSQLRouter() {
     SQLRouterOptions sql_opt;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
-    sql_opt.session_timeout = 60000;
+    sql_opt.zk_session_timeout = 60000;
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
-    return NewClusterSQLRouter(sql_opt);
+    auto router = NewClusterSQLRouter(sql_opt);
+    SetOnlineMode(router);
+    return router;
 }
+
 static bool IsRequestSupportMode(const std::string& mode) {
-    if (mode.find("hybridse-only") != std::string::npos ||
-        mode.find("rtidb-unsupport") != std::string::npos ||
+    if (mode.find("hybridse-only") != std::string::npos || mode.find("rtidb-unsupport") != std::string::npos ||
         mode.find("performance-sensitive-unsupport") != std::string::npos ||
-            mode.find("request-unsupport") != std::string::npos
-        || mode.find("standalone-unsupport") != std::string::npos) {
+        mode.find("request-unsupport") != std::string::npos || mode.find("standalone-unsupport") != std::string::npos) {
         return false;
     }
     return true;
 }
 static bool IsBatchRequestSupportMode(const std::string& mode) {
-    if (mode.find("hybridse-only") != std::string::npos ||
-        mode.find("rtidb-unsupport") != std::string::npos ||
+    if (mode.find("hybridse-only") != std::string::npos || mode.find("rtidb-unsupport") != std::string::npos ||
         mode.find("performance-sensitive-unsupport") != std::string::npos ||
         mode.find("batch-request-unsupport") != std::string::npos ||
-        mode.find("request-unsupport") != std::string::npos
-        || mode.find("standalone-unsupport") != std::string::npos) {
+        mode.find("request-unsupport") != std::string::npos || mode.find("standalone-unsupport") != std::string::npos) {
         return false;
     }
     return true;
 }
 static bool IsBatchSupportMode(const std::string& mode) {
-    if (mode.find("hybridse-only") != std::string::npos ||
-        mode.find("rtidb-unsupport") != std::string::npos ||
+    if (mode.find("hybridse-only") != std::string::npos || mode.find("rtidb-unsupport") != std::string::npos ||
         mode.find("batch-unsupport") != std::string::npos ||
         mode.find("performance-sensitive-unsupport") != std::string::npos ||
         mode.find("standalone-unsupport") != std::string::npos) {
@@ -87,7 +86,7 @@ TEST_P(SQLSDKTest, SqlSdkBatchTest) {
         return;
     }
     SQLRouterOptions sql_opt;
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
     sql_opt.enable_debug = sql_case.debug() || hybridse::sqlcase::SqlCase::IsDebug();
@@ -96,6 +95,7 @@ TEST_P(SQLSDKTest, SqlSdkBatchTest) {
         FAIL() << "Fail new cluster sql router";
         return;
     }
+    SetOnlineMode(router);
     SQLSDKTest::RunBatchModeSDK(sql_case, router, mc_->GetTbEndpoint());
 }
 
@@ -136,7 +136,7 @@ TEST_P(SQLSDKQueryTest, SqlSdkBatchTest) {
 TEST_P(SQLSDKQueryTest, SqlSdkRequestProcedureTest) {
     auto sql_case = GetParam();
     LOG(INFO) << "ID: " << sql_case.id() << ", DESC: " << sql_case.desc();
-    if (!IsRequestSupportMode(sql_case.mode())) {
+    if (!IsRequestSupportMode(sql_case.mode()) || "procedure-unsupport" == sql_case.mode()) {
         LOG(WARNING) << "Unsupport mode: " << sql_case.mode();
         return;
     }
@@ -148,7 +148,7 @@ TEST_P(SQLSDKQueryTest, SqlSdkRequestProcedureTest) {
 TEST_P(SQLSDKQueryTest, SqlSdkRequestProcedureAsynTest) {
     auto sql_case = GetParam();
     LOG(INFO) << "ID: " << sql_case.id() << ", DESC: " << sql_case.desc();
-    if (!IsRequestSupportMode(sql_case.mode())) {
+    if (!IsRequestSupportMode(sql_case.mode()) || "procedure-unsupport" == sql_case.mode()) {
         LOG(WARNING) << "Unsupport mode: " << sql_case.mode();
         return;
     }
@@ -156,6 +156,21 @@ TEST_P(SQLSDKQueryTest, SqlSdkRequestProcedureAsynTest) {
     RunRequestProcedureModeSDK(sql_case, router_, true);
     LOG(INFO) << "Finish sql_sdk_request_procedure_asyn_test: ID: " << sql_case.id() << ", DESC: " << sql_case.desc();
 }
+
+TEST_P(SQLSDKQueryTest, SqlSdkDeployTest) {
+    auto sql_case = GetParam();
+    if (!sql_case.deployable_) {
+        LOG(INFO) << "SKIPPED for not deployable";
+        return;
+    }
+    ASSERT_TRUE(router_ != nullptr) << "Fail new cluster sql router";
+    {
+        DeploymentEnv env(router_, &sql_case);
+        env.SetUp();
+        env.CallDeployProcedure();
+    }
+}
+
 TEST_P(SQLSDKBatchRequestQueryTest, SqlSdkBatchRequestTest) {
     auto sql_case = GetParam();
     if (!IsBatchRequestSupportMode(sql_case.mode())) {
@@ -173,7 +188,7 @@ TEST_P(SQLSDKBatchRequestQueryTest, SqlSdkBatchRequestTest) {
 }
 TEST_P(SQLSDKBatchRequestQueryTest, SqlSdkBatchRequestProcedureTest) {
     auto sql_case = GetParam();
-    if (!IsBatchRequestSupportMode(sql_case.mode())) {
+    if (!IsBatchRequestSupportMode(sql_case.mode()) || "procedure-unsupport" == sql_case.mode()) {
         LOG(WARNING) << "Unsupport mode: " << sql_case.mode();
         return;
     }
@@ -189,7 +204,7 @@ TEST_P(SQLSDKBatchRequestQueryTest, SqlSdkBatchRequestProcedureTest) {
 
 TEST_P(SQLSDKBatchRequestQueryTest, SqlSdkBatchRequestProcedureAsynTest) {
     auto sql_case = GetParam();
-    if (!IsBatchRequestSupportMode(sql_case.mode())) {
+    if (!IsBatchRequestSupportMode(sql_case.mode()) || "procedure-unsupport" == sql_case.mode()) {
         LOG(WARNING) << "Unsupport mode: " << sql_case.mode();
         return;
     }
@@ -208,7 +223,7 @@ TEST_F(SQLSDKQueryTest, ExecuteLatestWhereTest) {
         "create table latest_table(c1 string, c2 int, c3 timestamp, c4 timestamp, "
         "index(key=(c1),ts=c4,ttl_type=latest, ttl=2));";
     SQLRouterOptions sql_opt;
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
@@ -216,6 +231,7 @@ TEST_F(SQLSDKQueryTest, ExecuteLatestWhereTest) {
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "sql_latest_where_test";
     hybridse::sdk::Status status;
     ASSERT_TRUE(router->CreateDB(db, &status));
@@ -271,7 +287,7 @@ TEST_F(SQLSDKQueryTest, ExecuteWhereTest) {
         "                   index(key=pay_card_no, ts=txn_time),\n"
         "                   index(key=merch_id, ts=txn_time));";
     SQLRouterOptions sql_opt;
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
@@ -279,6 +295,7 @@ TEST_F(SQLSDKQueryTest, ExecuteWhereTest) {
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "sql_where_test";
     hybridse::sdk::Status status;
     ASSERT_TRUE(router->CreateDB(db, &status));
@@ -347,7 +364,7 @@ TEST_F(SQLSDKQueryTest, ExecuteInsertLoopsTest) {
     int64_t error_cnt = 0;
     int64_t cnt = 0;
     SQLRouterOptions sql_opt;
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
@@ -355,6 +372,7 @@ TEST_F(SQLSDKQueryTest, ExecuteInsertLoopsTest) {
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "leak_test";
     hybridse::sdk::Status status;
     router->CreateDB(db, &status);
@@ -399,7 +417,7 @@ TEST_F(SQLSDKQueryTest, CreateNoTs) {
         "                c2 bigint,\n"
         "                index(key=c1, ttl=14400m, ttl_type=absolute));";
     SQLRouterOptions sql_opt;
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
@@ -407,6 +425,7 @@ TEST_F(SQLSDKQueryTest, CreateNoTs) {
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "create_no_ts";
     hybridse::sdk::Status status;
     ASSERT_TRUE(router->CreateDB(db, &status));
@@ -438,16 +457,17 @@ TEST_F(SQLSDKQueryTest, RequestProcedureTest) {
         "                   c6 double,\n"
         "                   c7 timestamp,\n"
         "                   c8 date,\n"
-        "                   index(key=c1, ts=c7));";
+        "                   index(key=c1, ts=c7)) OPTIONS(replicanum=1, partitionnum=1);";
     SQLRouterOptions sql_opt;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
     auto router = NewClusterSQLRouter(sql_opt);
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "test";
     hybridse::sdk::Status status;
     router->CreateDB(db, &status);
@@ -548,7 +568,6 @@ TEST_F(SQLSDKQueryTest, RequestProcedureTest) {
     ASSERT_TRUE(router->ExecuteDDL(db, "drop table trans;", &status));
 }
 
-
 TEST_F(SQLSDKQueryTest, DropTableWithProcedureTest) {
     // create table trans
     std::string ddl =
@@ -573,12 +592,13 @@ TEST_F(SQLSDKQueryTest, DropTableWithProcedureTest) {
     SQLRouterOptions sql_opt;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
     auto router = NewClusterSQLRouter(sql_opt);
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "test_db1";
     std::string db2 = "test_db2";
     hybridse::sdk::Status status;
@@ -643,6 +663,7 @@ TEST_F(SQLSDKTest, TableReaderScan) {
     sql_opt.zk_path = mc_->GetZkPath();
     auto router = NewClusterSQLRouter(sql_opt);
     ASSERT_TRUE(router != nullptr);
+    SetOnlineMode(router);
     std::string db = GenRand("db");
     ::hybridse::sdk::Status status;
     bool ok = router->CreateDB(db, &status);
@@ -675,6 +696,7 @@ TEST_F(SQLSDKTest, TableReaderAsyncScan) {
     sql_opt.zk_path = mc_->GetZkPath();
     auto router = NewClusterSQLRouter(sql_opt);
     ASSERT_TRUE(router != nullptr);
+    SetOnlineMode(router);
     std::string db = GenRand("db");
     ::hybridse::sdk::Status status;
     bool ok = router->CreateDB(db, &status);
@@ -708,6 +730,7 @@ TEST_F(SQLSDKTest, CreateTable) {
     sql_opt.zk_path = mc_->GetZkPath();
     auto router = NewClusterSQLRouter(sql_opt);
     ASSERT_TRUE(router != nullptr);
+    SetOnlineMode(router);
     std::string db = GenRand("db");
     ::hybridse::sdk::Status status;
     bool ok = router->CreateDB(db, &status);
@@ -738,7 +761,7 @@ TEST_F(SQLSDKTest, CreateTable) {
             }
         }
     }
-    ASSERT_EQ(pid_map.size(), 1u);
+    ASSERT_EQ(pid_map.size(), 3u);
     ASSERT_TRUE(router->ExecuteDDL(db, "drop table test0;", &status));
     ASSERT_TRUE(router->ExecuteDDL(db, "drop table test1;", &status));
     ASSERT_TRUE(router->DropDB(db, &status));
@@ -774,7 +797,7 @@ TEST_F(SQLSDKQueryTest, ExecuteWhereWithParameter) {
         "                   index(key=pay_card_no, ts=txn_time),\n"
         "                   index(key=merch_id, ts=txn_time));";
     SQLRouterOptions sql_opt;
-    sql_opt.session_timeout = 30000;
+    sql_opt.zk_session_timeout = 30000;
     sql_opt.zk_cluster = mc_->GetZkCluster();
     sql_opt.zk_path = mc_->GetZkPath();
     sql_opt.enable_debug = hybridse::sqlcase::SqlCase::IsDebug();
@@ -782,6 +805,7 @@ TEST_F(SQLSDKQueryTest, ExecuteWhereWithParameter) {
     if (!router) {
         FAIL() << "Fail new cluster sql router";
     }
+    SetOnlineMode(router);
     std::string db = "execute_where_with_parameter";
     hybridse::sdk::Status status;
     ASSERT_TRUE(router->CreateDB(db, &status));
@@ -894,15 +918,18 @@ TEST_F(SQLSDKQueryTest, ExecuteWhereWithParameter) {
 }  // namespace openmldb
 
 int main(int argc, char** argv) {
-    ::hybridse::vm::Engine::InitializeGlobalLLVM();
     ::testing::InitGoogleTest(&argc, argv);
+    ::google::ParseCommandLineFlags(&argc, &argv, true);
+    ::hybridse::vm::Engine::InitializeGlobalLLVM();
+    ::openmldb::base::SetupGlog(true);
+    ::openmldb::test::InitRandomDiskFlags("sql_sdk_test");
+
     srand(time(NULL));
     FLAGS_zk_session_timeout = 100000;
     ::openmldb::sdk::MiniCluster mc(6181);
     ::openmldb::sdk::mc_ = &mc;
     int ok = ::openmldb::sdk::mc_->SetUp(3);
-    sleep(1);
-    ::google::ParseCommandLineFlags(&argc, &argv, true);
+    sleep(5);
     ::openmldb::sdk::router_ = ::openmldb::sdk::GetNewSQLRouter();
     if (nullptr == ::openmldb::sdk::router_) {
         LOG(ERROR) << "Fail Test with NULL SQL router";

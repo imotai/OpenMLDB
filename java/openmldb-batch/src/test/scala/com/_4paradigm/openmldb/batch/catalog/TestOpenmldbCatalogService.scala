@@ -26,15 +26,16 @@ class TestOpenmldbCatalogService extends FunSuite {
     val zkCluster = "127.0.0.1:2181"
     val zkPath = "/openmldb"
 
-    val openmldbCatalogService = new OpenmldbCatalogService(zkCluster, zkPath)
+    val openmldbCatalogService = new OpenmldbCatalogService(zkCluster, zkPath, "root", "root")
 
     val databases = openmldbCatalogService.getDatabases
     for (i <- databases.indices) {
       println(s"Database $i: ${databases(i)}")
     }
-
     val tables = openmldbCatalogService.getTableNames("__INTERNAL_DB")
     for (i <- tables.indices) {
+      val internalTableNames = List("JOB_INFO", "PRE_AGG_META_INFO")
+      assert(internalTableNames.contains(tables(i)))
       println(s"Table $i: ${tables(i)}")
     }
 

@@ -17,17 +17,13 @@
 #ifndef SRC_CODEC_CODEC_H_
 #define SRC_CODEC_CODEC_H_
 
-#include <stdio.h>
-#include <stdlib.h>
-
 #include <map>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "base/endianconv.h"
+#include "absl/base/attributes.h"
 #include "base/strings.h"
 #include "proto/common.pb.h"
 
@@ -36,18 +32,13 @@ namespace codec {
 
 using ProjectList = ::google::protobuf::RepeatedField<uint32_t>;
 using Schema = ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnDesc>;
-static constexpr uint8_t VERSION_LENGTH = 2;
-static constexpr uint8_t SIZE_LENGTH = 4;
-static constexpr uint8_t HEADER_LENGTH = VERSION_LENGTH + SIZE_LENGTH;
-static constexpr uint32_t UINT24_MAX = (1 << 24) - 1;
+inline constexpr uint8_t VERSION_LENGTH = 2;
+inline constexpr uint8_t SIZE_LENGTH = 4;
+inline constexpr uint8_t HEADER_LENGTH = VERSION_LENGTH + SIZE_LENGTH;
+inline constexpr uint32_t UINT24_MAX = (1 << 24) - 1;
 
-struct RowContext;
 class RowBuilder;
 class RowView;
-class RowProject;
-
-// TODO(wangtaize) share the row codec context
-struct RowContext {};
 
 class RowProject {
  public:
@@ -79,42 +70,59 @@ class RowBuilder {
     explicit RowBuilder(const Schema& schema);
 
     uint32_t CalTotalLength(uint32_t string_length);
+    bool InitBuffer(int8_t* buf, uint32_t size, bool need_clear);
     bool SetBuffer(int8_t* buf, uint32_t size);
     bool SetBuffer(int8_t* buf, uint32_t size, bool need_clear);
-    bool AppendBool(bool val);
-    bool AppendInt32(int32_t val);
-    bool AppendInt16(int16_t val);
-    bool AppendInt64(int64_t val);
-    bool AppendTimestamp(int64_t val);
-    bool AppendFloat(float val);
-    bool AppendDouble(double val);
-    bool AppendString(const char* val, uint32_t length);
-    bool AppendNULL();
-    bool AppendDate(uint32_t year, uint32_t month, uint32_t day);
+    ABSL_MUST_USE_RESULT bool AppendBool(bool val);
+    ABSL_MUST_USE_RESULT bool AppendInt32(int32_t val);
+    ABSL_MUST_USE_RESULT bool AppendInt16(int16_t val);
+    ABSL_MUST_USE_RESULT bool AppendInt64(int64_t val);
+    ABSL_MUST_USE_RESULT bool AppendTimestamp(int64_t val);
+    ABSL_MUST_USE_RESULT bool AppendFloat(float val);
+    ABSL_MUST_USE_RESULT bool AppendDouble(double val);
+    ABSL_MUST_USE_RESULT bool AppendString(const char* val, uint32_t length);
+    ABSL_MUST_USE_RESULT bool AppendNULL();
+    ABSL_MUST_USE_RESULT bool SetNULL(uint32_t index);
+    ABSL_MUST_USE_RESULT bool SetNULL(int8_t* buf, uint32_t size, uint32_t index);
+    ABSL_MUST_USE_RESULT bool AppendDate(uint32_t year, uint32_t month, uint32_t day);
     // append the date that encoded
-    bool AppendDate(int32_t date);
-    bool AppendValue(const std::string& val);
-    bool SetBool(uint32_t index, bool val);
-    bool SetInt32(uint32_t index, int32_t val);
-    bool SetInt16(uint32_t index, int16_t val);
-    bool SetInt64(uint32_t index, int64_t val);
-    bool SetTimestamp(uint32_t index, int64_t val);
-    bool SetFloat(uint32_t index, float val);
-    bool SetDouble(uint32_t index, double val);
-    bool SetDate(uint32_t index, uint32_t year, uint32_t month, uint32_t day);
+    ABSL_MUST_USE_RESULT bool AppendDate(int32_t date);
+    ABSL_MUST_USE_RESULT bool AppendValue(const std::string& val);
+    ABSL_MUST_USE_RESULT bool SetBool(uint32_t index, bool val);
+    ABSL_MUST_USE_RESULT bool SetBool(int8_t* buf, uint32_t index, bool val);
+    ABSL_MUST_USE_RESULT bool SetInt16(uint32_t index, int16_t val);
+    ABSL_MUST_USE_RESULT bool SetInt16(int8_t* buf, uint32_t index, int16_t val);
+    ABSL_MUST_USE_RESULT bool SetInt32(uint32_t index, int32_t val);
+    ABSL_MUST_USE_RESULT bool SetInt32(int8_t* buf, uint32_t index, int32_t val);
+    ABSL_MUST_USE_RESULT bool SetInt64(uint32_t index, int64_t val);
+    ABSL_MUST_USE_RESULT bool SetInt64(int8_t* buf, uint32_t index, int64_t val);
+    ABSL_MUST_USE_RESULT bool SetTimestamp(uint32_t index, int64_t val);
+    ABSL_MUST_USE_RESULT bool SetTimestamp(int8_t* buf, uint32_t index, int64_t val);
+    ABSL_MUST_USE_RESULT bool SetFloat(uint32_t index, float val);
+    ABSL_MUST_USE_RESULT bool SetFloat(int8_t* buf, uint32_t index, float val);
+    ABSL_MUST_USE_RESULT bool SetDouble(uint32_t index, double val);
+    ABSL_MUST_USE_RESULT bool SetDouble(int8_t* buf, uint32_t index, double val);
+    ABSL_MUST_USE_RESULT bool SetString(uint32_t index, const char* val, uint32_t length);
+    ABSL_MUST_USE_RESULT bool SetString(int8_t* buf, uint32_t size, uint32_t index, const char* val, uint32_t length);
+    ABSL_MUST_USE_RESULT bool SetDate(uint32_t index, uint32_t year, uint32_t month, uint32_t day);
+    ABSL_MUST_USE_RESULT bool SetDate(int8_t* buf, uint32_t index, uint32_t year, uint32_t month, uint32_t day);
     // set the date that encoded
-    bool SetDate(uint32_t index, int32_t date);
+    ABSL_MUST_USE_RESULT bool SetDate(uint32_t index, int32_t date);
+    ABSL_MUST_USE_RESULT bool SetDate(int8_t* buf, uint32_t index, int32_t date);
 
     void SetSchemaVersion(uint8_t version);
     inline bool IsComplete() { return cnt_ == (uint32_t)schema_.size(); }
     inline uint32_t GetAppendPos() { return cnt_; }
 
+    static bool ConvertDate(uint32_t year, uint32_t month, uint32_t day, uint32_t* val);
+
  private:
     bool Check(uint32_t index, ::openmldb::type::DataType type);
     inline void SetField(uint32_t index);
+    inline void SetField(int8_t* buf, uint32_t index);
     inline void SetStrOffset(uint32_t str_pos);
-    bool SetString(uint32_t index, const char* val, uint32_t length);
-    bool SetNULL(uint32_t index);
+    void SetStrOffset(int8_t* buf, uint32_t size, uint32_t str_pos, uint32_t str_offset);
+    bool GetStrOffset(int8_t* buf, uint32_t size, uint32_t str_pos, uint32_t* offset);
 
  private:
     const Schema& schema_;
@@ -139,39 +147,39 @@ class RowView {
 
     static uint8_t GetSchemaVersion(const int8_t* row) { return *(reinterpret_cast<const uint8_t*>(row + 1)); }
 
-    int32_t GetBool(uint32_t idx, bool* val);
-    int32_t GetInt32(uint32_t idx, int32_t* val);
-    int32_t GetInt64(uint32_t idx, int64_t* val);
-    int32_t GetTimestamp(uint32_t idx, int64_t* val);
-    int32_t GetInt16(uint32_t idx, int16_t* val);
-    int32_t GetFloat(uint32_t idx, float* val);
-    int32_t GetDouble(uint32_t idx, double* val);
-    int32_t GetString(uint32_t idx, char** val, uint32_t* length);
-    int32_t GetDate(uint32_t idx, uint32_t* year, uint32_t* month, uint32_t* day);
-    int32_t GetDate(uint32_t idx, int32_t* date);
-    bool IsNULL(uint32_t idx) { return IsNULL(row_, idx); }
-    inline bool IsNULL(const int8_t* row, uint32_t idx) {
+    int32_t GetBool(uint32_t idx, bool* val) const;
+    int32_t GetInt32(uint32_t idx, int32_t* val) const;
+    int32_t GetInt64(uint32_t idx, int64_t* val) const;
+    int32_t GetTimestamp(uint32_t idx, int64_t* val) const;
+    int32_t GetInt16(uint32_t idx, int16_t* val) const;
+    int32_t GetFloat(uint32_t idx, float* val) const;
+    int32_t GetDouble(uint32_t idx, double* val) const;
+    int32_t GetString(uint32_t idx, char** val, uint32_t* length) const;
+    int32_t GetDate(uint32_t idx, uint32_t* year, uint32_t* month, uint32_t* day) const;
+    int32_t GetDate(uint32_t idx, int32_t* date) const;
+    bool IsNULL(uint32_t idx) const { return IsNULL(row_, idx); }
+    inline bool IsNULL(const int8_t* row, uint32_t idx) const {
         const int8_t* ptr = row + HEADER_LENGTH + (idx >> 3);
         return *(reinterpret_cast<const uint8_t*>(ptr)) & (1 << (idx & 0x07));
     }
-    inline uint32_t GetSize() { return size_; }
+    inline uint32_t GetSize() const { return size_; }
 
     static inline uint32_t GetSize(const int8_t* row) {
         return *(reinterpret_cast<const uint32_t*>(row + VERSION_LENGTH));
     }
 
-    int32_t GetValue(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, void* val);
+    int32_t GetValue(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, void* val) const;
 
-    int32_t GetInteger(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, int64_t* val);
+    int32_t GetInteger(const int8_t* row, uint32_t idx, ::openmldb::type::DataType type, int64_t* val) const;
 
-    int32_t GetValue(const int8_t* row, uint32_t idx, char** val, uint32_t* length);
+    int32_t GetValue(const int8_t* row, uint32_t idx, char** val, uint32_t* length) const;
 
-    int32_t GetStrValue(const int8_t* row, uint32_t idx, std::string* val);
-    int32_t GetStrValue(uint32_t idx, std::string* val);
+    int32_t GetStrValue(const int8_t* row, uint32_t idx, std::string* val) const;
+    int32_t GetStrValue(uint32_t idx, std::string* val) const;
 
  private:
     bool Init();
-    bool CheckValid(uint32_t idx, ::openmldb::type::DataType type);
+    bool CheckValid(uint32_t idx, ::openmldb::type::DataType type) const;
 
  private:
     uint8_t str_addr_length_;
@@ -184,71 +192,9 @@ class RowView {
     std::vector<uint32_t> offset_vec_;
 };
 
+bool ColumnSupportLegacyCodec(const openmldb::common::ColumnDesc&);
+
 namespace v1 {
-
-static constexpr uint8_t VERSION_LENGTH = 2;
-static constexpr uint8_t SIZE_LENGTH = 4;
-// calc the total row size with primary_size, str field count and str_size
-inline uint32_t CalcTotalLength(uint32_t primary_size, uint32_t str_field_cnt, uint32_t str_size,
-                                uint32_t* str_addr_space) {
-    uint32_t total_size = primary_size + str_size;
-    if (total_size + str_field_cnt <= UINT8_MAX) {
-        *str_addr_space = 1;
-        return total_size + str_field_cnt;
-    } else if (total_size + str_field_cnt * 2 <= UINT16_MAX) {
-        *str_addr_space = 2;
-        return total_size + str_field_cnt * 2;
-    } else if (total_size + str_field_cnt * 3 <= 1 << 24) {
-        *str_addr_space = 3;
-        return total_size + str_field_cnt * 3;
-    } else {
-        *str_addr_space = 4;
-        return total_size + str_field_cnt * 4;
-    }
-}
-inline int32_t AppendInt16(int8_t* buf_ptr, uint32_t buf_size, int16_t val, uint32_t field_offset) {
-    if (field_offset + 2 > buf_size) {
-        return -1;
-    }
-    *(reinterpret_cast<int16_t*>(buf_ptr + field_offset)) = val;
-    return 4;
-}
-
-inline int32_t AppendFloat(int8_t* buf_ptr, uint32_t buf_size, float val, uint32_t field_offset) {
-    if (field_offset + 4 > buf_size) {
-        return -1;
-    }
-    *(reinterpret_cast<float*>(buf_ptr + field_offset)) = val;
-    return 4;
-}
-
-inline int32_t AppendInt32(int8_t* buf_ptr, uint32_t buf_size, int32_t val, uint32_t field_offset) {
-    if (field_offset + 4 > buf_size) {
-        return -1;
-    }
-    *(reinterpret_cast<int32_t*>(buf_ptr + field_offset)) = val;
-    return 4;
-}
-
-inline int32_t AppendInt64(int8_t* buf_ptr, uint32_t buf_size, int64_t val, uint32_t field_offset) {
-    if (field_offset + 8 > buf_size) {
-        return -1;
-    }
-    *(reinterpret_cast<int64_t*>(buf_ptr + field_offset)) = val;
-    return 8;
-}
-
-inline int32_t AppendDouble(int8_t* buf_ptr, uint32_t buf_size, double val, uint32_t field_offset) {
-    if (field_offset + 8 > buf_size) {
-        return -1;
-    }
-
-    *(reinterpret_cast<double*>(buf_ptr + field_offset)) = val;
-    return 8;
-}
-
-int32_t AppendString(int8_t* buf_ptr, uint32_t buf_size, int8_t* val, uint32_t size, uint32_t str_start_offset,
-                     uint32_t str_field_offset, uint32_t str_addr_space, uint32_t str_body_offset);
 
 inline int8_t GetAddrSpace(uint32_t size) {
     if (size <= UINT8_MAX) {
@@ -294,13 +240,6 @@ int32_t GetCol(int8_t* input, int32_t offset, int32_t type_id, int8_t* data);
 int32_t GetStrCol(int8_t* input, int32_t str_field_offset, int32_t next_str_field_offset, int32_t str_start_offset,
                   int32_t type_id, int8_t* data);
 }  // namespace v1
-
-inline std::string Int64ToString(const int64_t key) {
-    std::stringstream ss;
-    ss << std::hex << key;
-    std::string key_str = ss.str();
-    return key_str;
-}
 
 }  // namespace codec
 }  // namespace openmldb

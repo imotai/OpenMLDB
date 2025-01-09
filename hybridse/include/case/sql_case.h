@@ -16,14 +16,18 @@
 
 #ifndef HYBRIDSE_INCLUDE_CASE_SQL_CASE_H_
 #define HYBRIDSE_INCLUDE_CASE_SQL_CASE_H_
-#include <vm/catalog.h>
-#include <yaml-cpp/node/node.h>
-#include <yaml-cpp/yaml.h>
+
 #include <set>
 #include <string>
 #include <vector>
+
+#include "absl/status/statusor.h"
 #include "codec/fe_row_codec.h"
 #include "proto/fe_type.pb.h"
+#include "vm/catalog.h"
+#include "yaml-cpp/node/node.h"
+#include "yaml-cpp/yaml.h"
+
 namespace hybridse {
 namespace sqlcase {
 class SqlCase {
@@ -55,10 +59,18 @@ class SqlCase {
         std::set<size_t> common_column_indices_;
         // SqlNode's TreeString output
         std::string node_tree_str_;
+        // PlanNode TreeString
+        std::string plan_tree_str_;
         bool success_ = true;
         int code_ = -1;
         std::string msg_;
     };
+    struct Deployment {
+        // deployment name, if empty, generated randomly at runtime
+        std::string name_;
+    };
+
+
     SqlCase() {}
     virtual ~SqlCase() {}
 
@@ -106,10 +118,10 @@ class SqlCase {
     const codec::Schema ExtractParameterTypes() const;
 
     bool ExtractInputData(std::vector<hybridse::codec::Row>& rows,  // NOLINT
-                          int32_t input_idx = 0) const;
-    bool ExtractInputData(
-        const TableInfo& info,
-        std::vector<hybridse::codec::Row>& rows) const;  // NOLINT
+                          int32_t input_idx, const codec::Schema& sc) const;
+    bool ExtractInputData(const TableInfo& info,
+                          std::vector<hybridse::codec::Row>& rows,  // NOLINT
+                          const codec::Schema&) const;
     bool ExtractOutputData(
         std::vector<hybridse::codec::Row>& rows) const;  // NOLINT
 
@@ -171,6 +183,7 @@ class SqlCase {
         const std::string& cases_dir, const std::string& resource_path,
         type::TableDef& table,                     // NOLINT
         std::vector<hybridse::codec::Row>& rows);  // NOLINT
+
     static bool CreateSqlCasesFromYaml(
         const std::string& cases_dir, const std::string& yaml_path,
         std::vector<SqlCase>& sql_case_ptr,  // NOLINT
@@ -179,6 +192,7 @@ class SqlCase {
         const std::string& cases_dir, const std::string& yaml_path,
         std::vector<SqlCase>& sql_case_ptr,  // NOLINT
         const std::vector<std::string>& filter_modes);
+
     static bool CreateTableInfoFromYaml(const std::string& cases_dir,
                                         const std::string& yaml_path,
                                         TableInfo* table_info);
@@ -191,14 +205,10 @@ class SqlCase {
     static std::string GenRand(const std::string& prefix) {
         return prefix + std::to_string(rand() % 10000000 + 1);  // NOLINT
     }
-    bool BuildCreateSpSqlFromInput(int32_t input_idx,
-                                   const std::string& select_sql,
-                                   const std::set<size_t>& common_idx,
-                                   std::string* create_sp_sql);
-    bool BuildCreateSpSqlFromSchema(const type::TableDef& table,
-                                    const std::string& select_sql,
-                                    const std::set<size_t>& common_idx,
-                                    std::string* create_sql);
+    absl::StatusOr<std::string> BuildCreateSpSql(absl::string_view sql, const std::set<size_t>& common_idx,
+                                                 std::optional<int32_t> input_idx);
+    absl::StatusOr<std::string> BuildCreateSpSql(absl::string_view select_sql, const std::set<size_t>& common_idx,
+                                                 std::optional<const type::TableDef*> table);
 
     friend std::ostream& operator<<(std::ostream& output, const SqlCase& thiz);
     static bool IS_PERF() {
@@ -210,18 +220,12 @@ class SqlCase {
         return false;
     }
     static std::set<std::string> HYBRIDSE_LEVEL();
-    static std::string SqlCaseBaseDir() {
-        const char* env_name = "SQL_CASE_BASE_DIR";
-        char* value = getenv(env_name);
-        if (value != nullptr) {
-            return std::string(value);
-        }
-        value = getenv("YAML_CASE_BASE_DIR");
-        if (value != nullptr) {
-            return std::string(value);
-        }
-        return "";
-    }
+
+    // Get the base directory searching for yaml test cases.
+    // It is by default directory to current git repository, or you can override
+    // the base directory with 'SQL_CASE_BASE_DIR' environment variable
+    static std::string SqlCaseBaseDir();
+
     static bool IsDebug() {
         const char* env_name = "HYBRIDSE_DEV";
         char* value = getenv(env_name);
@@ -304,7 +308,7 @@ class SqlCase {
     std::string db_;
     std::string sql_str_;
     std::vector<std::string> sql_strs_;
-    bool debug_;
+    bool debug_ = false;
     bool standard_sql_;
     bool standard_sql_compatible_;
     bool batch_request_optimized_;
@@ -318,6 +322,10 @@ class SqlCase {
     YAML::Node raw_node_;
     std::string sp_name_;
     int level_ = 0;
+
+    // also generate deployment test for the query
+    bool deployable_ = false;
+    Deployment deployment_;
 };
 std::string FindSqlCaseBaseDirPath();
 
@@ -326,6 +334,10 @@ std::vector<SqlCase> InitCases(std::string yaml_path, std::vector<std::string> f
 void InitCases(std::string yaml_path, std::vector<SqlCase>& cases);  // NOLINT
 void InitCases(std::string yaml_path, std::vector<SqlCase>& cases, // NOLINT
                const std::vector<std::string>& filters);
+
+// TODO(someone): consider move the function to production code so others will take usage.
+absl::StatusOr<std::vector<codec::Row>> ExtractInsertRow(vm::HybridSeJitWrapper*, absl::string_view insert,
+                                                         const codec::Schema* table_schema);
 }  // namespace sqlcase
 }  // namespace hybridse
 #endif  // HYBRIDSE_INCLUDE_CASE_SQL_CASE_H_

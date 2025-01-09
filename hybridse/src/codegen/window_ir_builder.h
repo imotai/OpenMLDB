@@ -17,15 +17,10 @@
 #ifndef HYBRIDSE_SRC_CODEGEN_WINDOW_IR_BUILDER_H_
 #define HYBRIDSE_SRC_CODEGEN_WINDOW_IR_BUILDER_H_
 
-#include <map>
 #include <string>
-#include <utility>
-#include <vector>
-#include "codec/fe_row_codec.h"
-#include "codegen/ir_base_builder.h"
-#include "llvm/IR/IRBuilder.h"
+
+#include "llvm/IR/Value.h"
 #include "proto/fe_type.pb.h"
-#include "vm/catalog.h"
 #include "vm/schemas_context.h"
 
 namespace hybridse {
@@ -58,15 +53,20 @@ class MemoryWindowDecodeIRBuilder : public WindowDecodeIRBuilder {
                                      int64_t end, ::llvm::Value** output);
     virtual bool BuildInnerRowsList(::llvm::Value* window_ptr, int64_t start,
                                     int64_t end, ::llvm::Value** output);
+
+    bool BuildInnerRowsRangeList(::llvm::Value* window_ptr, ::llvm::Value* row_key, int64_t start_rows,
+                                 int64_t end_range, ::llvm::Value** output);
     virtual bool BuildGetCol(size_t schema_idx, size_t col_idx,
                              ::llvm::Value* window_ptr, ::llvm::Value** output);
 
  private:
+    // get value from a base type column except string
     bool BuildGetPrimaryCol(const std::string& fn_name, ::llvm::Value* row_ptr,
                             size_t schema_idx, size_t col_idx, uint32_t offset,
-                            hybridse::node::TypeNode* type,
+                            hybridse::node::TypeNode* type, type::Type base_type,
                             ::llvm::Value** output);
 
+    // get value from a string column
     bool BuildGetStringCol(size_t schema_idx, size_t col_idx, uint32_t offset,
                            uint32_t next_str_field_offset,
                            uint32_t str_start_offset,

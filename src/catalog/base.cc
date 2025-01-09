@@ -41,6 +41,13 @@ ProcedureInfoImpl::ProcedureInfoImpl(const ::openmldb::api::ProcedureInfo& proce
     if (procedure.type() == ::openmldb::type::ProcedureType::kReqDeployment) {
         type_ = ::hybridse::sdk::ProcedureType::kReqDeployment;
     }
+
+    for (const auto& op : procedure.options()) {
+        options_[op.name()] = op.value().value();
+    }
+    if (procedure.router_col_size() > 0) {
+        router_col_ = procedure.router_col(0);
+    }
 }
 
 }  // namespace catalog

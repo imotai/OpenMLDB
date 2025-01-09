@@ -17,8 +17,8 @@
 #include <gflags/gflags.h>
 #include <stdio.h>
 
+#include "absl/strings/str_replace.h"
 #include "benchmark/benchmark.h"
-#include "boost/algorithm/string.hpp"
 #include "codec/fe_row_codec.h"
 #include "schema/schema_adapter.h"
 #include "sdk/base.h"
@@ -27,19 +27,19 @@
 #include "sdk/sql_router.h"
 #include "sdk/table_reader.h"
 #include "test/base_test.h"
+#include "test/util.h"
 #include "vm/catalog.h"
 
 DECLARE_bool(enable_distsql);
 DECLARE_bool(enable_localtablet);
 
-typedef ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnDesc> RtiDBSchema;
+typedef ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnDesc> PBSchema;
 typedef ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnKey> RtiDBIndex;
 
 ::openmldb::sdk::MiniCluster* mc;
 
 static void BM_SimpleQueryFunction(benchmark::State& state) {  // NOLINT
     ::openmldb::nameserver::TableInfo table_info;
-    table_info.set_format_version(1);
     std::string name = "test" + GenRand();
     std::string db = "db" + GenRand();
     auto ns_client = mc->GetNsClient();
@@ -48,7 +48,7 @@ static void BM_SimpleQueryFunction(benchmark::State& state) {  // NOLINT
     table_info.set_name(name);
     table_info.set_db(db);
     table_info.set_partition_num(1);
-    RtiDBSchema* schema = table_info.mutable_column_desc();
+    PBSchema* schema = table_info.mutable_column_desc();
     auto col1 = schema->Add();
     col1->set_name("col1");
     col1->set_data_type(::openmldb::type::kVarchar);
@@ -70,7 +70,7 @@ static void BM_SimpleQueryFunction(benchmark::State& state) {  // NOLINT
     key1->set_index_name("index0");
     key1->add_col_name("col1");
     key1->set_ts_name("col2");
-    ok = ns_client->CreateTable(table_info, error);
+    ok = ns_client->CreateTable(table_info, false, error);
 
     ::hybridse::vm::Schema fe_schema;
     ::openmldb::schema::SchemaAdapter::ConvertSchema(table_info.column_desc(), &fe_schema);
@@ -86,9 +86,9 @@ static void BM_SimpleQueryFunction(benchmark::State& state) {  // NOLINT
     rb.AppendInt64(ts);
     rb.AppendInt64(ts);
     rb.AppendInt64(ts);
-    ::openmldb::sdk::ClusterOptions option;
-    option.zk_cluster = mc->GetZkCluster();
-    option.zk_path = mc->GetZkPath();
+    auto option = std::make_shared<::openmldb::sdk::SQLRouterOptions>();
+    option->zk_cluster = mc->GetZkCluster();
+    option->zk_path = mc->GetZkPath();
     ::openmldb::sdk::ClusterSDK sdk(option);
     sdk.Init();
     std::vector<std::shared_ptr<::openmldb::catalog::TabletAccessor>> tablet;
@@ -97,7 +97,7 @@ static void BM_SimpleQueryFunction(benchmark::State& state) {  // NOLINT
     uint32_t tid = sdk.GetTableId(db, name);
     {
         for (int32_t i = 0; i < 1000; i++) {
-            ok = tablet[0]->GetClient()->Put(tid, 0, pk, ts + i, value, 1);
+            tablet[0]->GetClient()->Put(tid, 0, pk, ts + i, value);
         }
     }
     std::string sql = "select col1, col2 + 1, col3, col4, col5 from " + name + " ;";
@@ -691,7 +691,7 @@ FROM {0}
 last join {1} order by {1}.x7 on {0}.c1 = {1}.x1 and {0}.c7 - {ts_diff} >= {1}.x7
 last join {2} order by {2}.x7 on {0}.c2 = {2}.x2 and {0}.c7 - {ts_diff} >= {2}.x7;
 )");
-    boost::replace_all(sql_case.sql_str_, "{ts_diff}", std::to_string(state.range(0) * 1000 / 2));
+    absl::StrReplaceAll({{"{ts_diff}", std::to_string(state.range(0) * 1000 / 2)}}, &sql_case.sql_str_);
     BM_RequestQuery(state, sql_case, mc);
 }
 static void BM_SimpleLastJoinTable4(benchmark::State& state) {  // NOLINT
@@ -706,7 +706,7 @@ last join {2} order by {2}.x7 on {0}.c2 = {2}.x2 and {0}.c7 - {ts_diff} >= {2}.x
 last join {3} order by {3}.x7 on {0}.c3 = {3}.x3 and {0}.c7 - {ts_diff} >= {3}.x7
 last join {4} order by {4}.x7 on {0}.c4 = {4}.x4 and {0}.c7 - {ts_diff} >= {4}.x7;
 )";
-    boost::replace_all(sql_case.sql_str_, "{ts_diff}", std::to_string(state.range(0) * 1000 / 2));
+    absl::StrReplaceAll({{"{ts_diff}", std::to_string(state.range(0) * 1000 / 2)}}, &sql_case.sql_str_);
     BM_RequestQuery(state, sql_case, mc);
 }
 
@@ -732,7 +732,7 @@ window w1 as (PARTITION BY {0}.c1 ORDER BY {0}.c7 ROWS_RANGE BETWEEN 10d PRECEDI
 last join {1} as t2 order by t2.x7 on c2 = t2.x2 and c7 - {ts_diff} >= t2.x7
 ;
 )";
-    boost::replace_all(sql_case.sql_str_, "{ts_diff}", std::to_string(state.range(0) * 1000 / 2));
+    absl::StrReplaceAll({{"{ts_diff}", std::to_string(state.range(0) * 1000 / 2)}}, &sql_case.sql_str_);
     BM_RequestQuery(state, sql_case, mc);
 }
 static void BM_SimpleWindowOutputLastJoinTable4(benchmark::State& state) {  // NOLINT
@@ -758,7 +758,7 @@ static void BM_SimpleWindowOutputLastJoinTable4(benchmark::State& state) {  // N
         last join {1} as t3 order by t3.x7 on c3 = t3.x3 and c7 - {ts_diff} >= t3.x7
         last join {1} as t4 order by t4.x7 on c4 = t4.x4 and c7 - {ts_diff} >= t4.x7;
 )";
-    boost::replace_all(sql_case.sql_str_, "{ts_diff}", std::to_string(state.range(0) * 1000 / 2));
+    absl::StrReplaceAll({{"{ts_diff}", std::to_string(state.range(0) * 1000 / 2)}}, &sql_case.sql_str_);
     BM_RequestQuery(state, sql_case, mc);
 }
 
@@ -893,7 +893,10 @@ BENCHMARK(BM_SimpleTableReaderAsyncMulti)
     ->Args({10000});
 
 int main(int argc, char** argv) {
+    ::google::ParseCommandLineFlags(&argc, &argv, true);
+    ::openmldb::base::SetupGlog(true);
     ::hybridse::vm::Engine::InitializeGlobalLLVM();
+    ::openmldb::test::InitRandomDiskFlags("mini_cluster_batch_bm");
     FLAGS_enable_distsql = hybridse::sqlcase::SqlCase::IsCluster();
     FLAGS_enable_localtablet = !hybridse::sqlcase::SqlCase::IsDisableLocalTablet();
     ::benchmark::Initialize(&argc, argv);

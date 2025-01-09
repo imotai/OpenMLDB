@@ -22,7 +22,6 @@
 #include <string>
 #include <vector>
 
-#include "glog/logging.h"
 #include "proto/fe_type.pb.h"
 #include "vm/catalog.h"
 #include "vm/mem_catalog.h"
@@ -97,6 +96,11 @@ class SimpleCatalog : public Catalog {
 
     bool InsertRows(const std::string &db, const std::string &table,
                     const std::vector<Row> &row);
+
+    std::vector<AggrTableInfo> GetAggrTables(const std::string &base_db, const std::string &base_table,
+                                             const std::string &aggr_func, const std::string &aggr_col,
+                                             const std::string &partition_cols, const std::string &order_col,
+                                             const std::string &filter_col) override;
 
  private:
     bool enable_index_;

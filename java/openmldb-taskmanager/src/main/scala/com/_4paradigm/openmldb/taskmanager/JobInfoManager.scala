@@ -20,6 +20,7 @@ import com._4paradigm.openmldb.sdk.SdkOption
 import com._4paradigm.openmldb.sdk.impl.SqlClusterExecutor
 import com._4paradigm.openmldb.taskmanager.config.TaskManagerConfig
 import com._4paradigm.openmldb.taskmanager.dao.{JobIdGenerator, JobInfo}
+import com._4paradigm.openmldb.taskmanager.util.HdfsUtil
 import com._4paradigm.openmldb.taskmanager.yarn.YarnClientUtil
 import org.slf4j.LoggerFactory
 import org.apache.hadoop.fs.{FileSystem, LocalFileSystem, Path}
@@ -42,21 +43,26 @@ object JobInfoManager {
   private val JOB_INFO_TABLE_NAME = "JOB_INFO"
 
   private val option = new SdkOption
-  option.setZkCluster(TaskManagerConfig.ZK_CLUSTER)
-  option.setZkPath(TaskManagerConfig.ZK_ROOT_PATH)
+  option.setZkCluster(TaskManagerConfig.getZkCluster)
+  option.setZkPath(TaskManagerConfig.getZkRootPath)
+  option.setUser(TaskManagerConfig.getUser)
+  option.setPassword(TaskManagerConfig.getPassword)
+
+  if (!TaskManagerConfig.getPassword.isEmpty) {
+    option.setPassword(TaskManagerConfig.getPassword)
+  }
   val sqlExecutor = new SqlClusterExecutor(option)
+  sqlExecutor.executeSQL("", "set @@execute_mode='online';")
 
   def createJobInfo(jobType: String, args: List[String] = List(), sparkConf: Map[String, String] = Map()): JobInfo = {
     val jobId = JobIdGenerator.getUniqueId
     val startTime = new java.sql.Timestamp(Calendar.getInstance.getTime().getTime())
     val initialState = "Submitted"
     val parameter = if (args != null && args.length>0) args.mkString(",") else ""
-    val cluster = sparkConf.getOrElse("spark.master", TaskManagerConfig.SPARK_MASTER)
-    // TODO: Require endTime is not null for insert sql
-    val defaultEndTime = startTime
+    val cluster = sparkConf.getOrElse("spark.master", TaskManagerConfig.getSparkMaster)
 
     // TODO: Parse if run in yarn or local
-    val jobInfo = new JobInfo(jobId, jobType, initialState, startTime, defaultEndTime, parameter, cluster, "", "")
+    val jobInfo = new JobInfo(jobId, jobType, initialState, startTime, null, parameter, cluster, "", "")
     jobInfo.sync()
     jobInfo
   }
@@ -67,15 +73,16 @@ object JobInfoManager {
   }
 
   def getAllJobs(): List[JobInfo] = {
-    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME"
+    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME CONFIG (execute_mode = 'online')"
     val rs = sqlExecutor.executeSQL(INTERNAL_DB_NAME, sql)
-    resultSetToJobs(rs)
+    // TODO: Reorder in output, use orderby desc if SQL supported
+    resultSetToJobs(rs).sortWith(_.getId > _.getId)
   }
 
   def getUnfinishedJobs(): List[JobInfo] = {
     // TODO: Now we can not add index for `state` and run sql with
     //  s"SELECT * FROM $tableName WHERE state NOT IN (${JobInfo.FINAL_STATE.mkString(",")})"
-    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME"
+    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME CONFIG (execute_mode = 'online')"
     val rs = sqlExecutor.executeSQL(INTERNAL_DB_NAME, sql)
 
     val jobs = mutable.ArrayBuffer[JobInfo]()
@@ -88,11 +95,11 @@ object JobInfoManager {
       }
     }
 
-    jobs.toList
+    jobs.toList.sortWith(_.getId > _.getId)
   }
 
   def stopJob(jobId: Int): JobInfo = {
-    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME WHERE id = $jobId"
+    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME WHERE id = $jobId CONFIG (execute_mode = 'online')"
     val rs = sqlExecutor.executeSQL(INTERNAL_DB_NAME, sql)
 
     val jobInfo = if (rs.getFetchSize == 0) {
@@ -124,7 +131,7 @@ object JobInfoManager {
 
   def getJob(jobId: Int): Option[JobInfo] = {
     // TODO: Require to get only one row, https://github.com/4paradigm/OpenMLDB/issues/704
-    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME WHERE id = $jobId"
+    val sql = s"SELECT * FROM $JOB_INFO_TABLE_NAME WHERE id = $jobId CONFIG (execute_mode = 'online')"
     val rs = sqlExecutor.executeSQL(INTERNAL_DB_NAME, sql)
 
     if (rs.getFetchSize == 0) {
@@ -149,11 +156,8 @@ object JobInfoManager {
     statement.setString(8, job.getApplicationId)
     statement.setString(9, job.getError)
 
-    var pstmt: PreparedStatement = null
     try {
       logger.info(s"Run insert SQL with job info: $job")
-      pstmt = sqlExecutor.getInsertPreparedStmt(INTERNAL_DB_NAME, insertSql)
-
       val ok = statement.execute()
       if (!ok) {
         logger.error("Fail to execute insert SQL")
@@ -161,11 +165,15 @@ object JobInfoManager {
     } catch {
       case e: SQLException =>
         e.printStackTrace()
-    } finally if (pstmt != null) try {
-      pstmt.close()
-    } catch {
-      case throwables: SQLException =>
-        throwables.printStackTrace()
+    } finally {
+      if (statement != null) {
+        try {
+          statement.close()
+        } catch {
+          case throwables: SQLException =>
+            throwables.printStackTrace()
+        }
+      }
     }
   }
 
@@ -201,25 +209,20 @@ object JobInfoManager {
       val offlineTableInfo = tableInfo.getOfflineTableInfo
 
       val filePath = offlineTableInfo.getPath
-      if(offlineTableInfo.getDeepCopy) {
-
+      if(filePath.nonEmpty) {
         if (filePath.startsWith("file://")) {
           val dir = new File(filePath.substring(7))
           logger.info(s"Try to delete the path ${filePath.substring(7)}")
           FileUtils.deleteDirectory(dir)
 
         } else if (filePath.startsWith("hdfs://")) {
-          val conf = new Configuration();
-          // TODO: Get namenode uri from config file
-          val namenodeUri = TaskManagerConfig.NAMENODE_URI
-          val hdfs = FileSystem.get(URI.create(s"hdfs://$namenodeUri"), conf)
-          hdfs.delete(new Path(filePath), true)
-
+          logger.info(s"Try to delete the HDFS path ${filePath}")
+          HdfsUtil.deleteHdfsDir(filePath)
         } else {
           throw new Exception(s"Get unsupported file path: $filePath")
         }
       } else {
-        logger.info(s"Do not delete file $filePath for non deep copy data")
+        logger.info(s"Do not delete for empty hard path")
       }
     }
 

@@ -31,9 +31,7 @@ cases:
           +-table: aa-bb.xx-yy
           +-IF NOT EXIST: 0
           +-column_desc_list: []
-          +-replica_num: 1
-          +-partition_num: 1
-          +-distribution_list: []
+          +-table_option_list: []
   - id: 4
     desc: DESC table aa-bb
     sql: DESC `aa-bb`;
@@ -120,7 +118,7 @@ cases:
     desc: Create table statement with back quote name
     sql: |
       create table `t-1` (`a-1` `int`, `b-1` `string`, index(key=(`a-1`, `b-1`), dump='12', `ts`=`column-2`, `ttl`=1d, `ttl_type`=absolute, `version`=(`column-5`, 3)))
-      options (`replicanum` = 3, `partitionnum` = 3, `ignored_option` = 'abc',
+      options (`replicanum` = 3, `partitionnum` = 3,
           distribution = [ ('leader1', ['fo1', 'fo2']) ]
       );
     expect:
@@ -133,12 +131,10 @@ cases:
           |  |  +-node[kColumnDesc]
           |  |    +-column_name: a-1
           |  |    +-column_type: int32
-          |  |    +-NOT NULL: 0
           |  +-1:
           |  |  +-node[kColumnDesc]
           |  |    +-column_name: b-1
           |  |    +-column_type: string
-          |  |    +-NOT NULL: 0
           |  +-2:
           |    +-node[kColumnIndex]
           |      +-keys: [a-1, b-1]
@@ -148,21 +144,30 @@ cases:
           |      +-ttl_type: absolute
           |      +-version_column: column-5
           |      +-version_count: 3
-          +-replica_num: 3
-          +-partition_num: 3
-          +-distribution_list[list]:
+          +-table_option_list[list]:
             +-0:
-            |  +-node[kPartitionMeta]
-            |    +-endpoint: leader1
-            |    +-role_type: leader
+            |  +-node[kReplicaNum]
+            |    +-replica_num: 3
             +-1:
-            |  +-node[kPartitionMeta]
-            |    +-endpoint: fo1
-            |    +-role_type: follower
+            |  +-node[kPartitionNum]
+            |    +-partition_num: 3
             +-2:
-              +-node[kPartitionMeta]
-                +-endpoint: fo2
-                +-role_type: follower
+              +-node[kDistributions]
+                +-distribution_list[list]:
+                  +-0:
+                    +-list[list]:
+                      +-0:
+                      |  +-node[kPartitionMeta]
+                      |    +-endpoint: leader1
+                      |    +-role_type: leader
+                      +-1:
+                      |  +-node[kPartitionMeta]
+                      |    +-endpoint: fo1
+                      |    +-role_type: follower
+                      +-2:
+                        +-node[kPartitionMeta]
+                          +-endpoint: fo2
+                          +-role_type: follower
   - id: 23
     desc: create index with back quote item name
     sql: |

@@ -15,11 +15,15 @@
  */
 package com._4paradigm.openmldb.common.codec;
 
+import com._4paradigm.openmldb.proto.Common;
+import com._4paradigm.openmldb.proto.Type;
 import com._4paradigm.openmldb.proto.Type.DataType;
 import com._4paradigm.openmldb.proto.Common.ColumnDesc;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.sql.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -102,4 +106,114 @@ public class CodecUtil {
         }
         return strLength;
     }
+
+
+    /**
+     * Convert date type to int value in OpenMLDB date format.
+     *
+     * @param date the date value
+     * @return the int value
+     */
+    public static int dateToDateInt(Date date) {
+        int year = date.getYear();
+        int month = date.getMonth();
+        int day = date.getDate();
+        int returnValue = year << 16;
+        returnValue = returnValue | (month << 8);
+        returnValue = returnValue | day;
+        return returnValue;
+    }
+
+    /**
+     * Convert number of days to int value in OpenMLDB date format.
+     *
+     * @param days the number of days
+     * @return the int value
+     */
+    public static int daysToDateInt(int days) {
+        Date date = new Date(days * 86400000L);
+        return dateToDateInt(date);
+    }
+
+    /**
+     * Convert int value of OpenMLDB date format to date type.
+     *
+     * @param dateInt the int value
+     * @return the date value
+     */
+    public static Date dateIntToDate(int dateInt) {
+        int date = dateInt;
+        int day = date & 0x0000000FF;
+        date = date >> 8;
+        int month = date & 0x0000FF;
+        int year = date >> 8;
+        return new Date(year, month, day);
+    }
+
+    /**
+     * Convert int value of OpenMLDB date format to number of days.
+     *
+     * @param dateInt the int value
+     * @return the number of days
+     */
+    public static int dateIntToDays(int dateInt) {
+        Date date = dateIntToDate(dateInt);
+        return (int)Math.ceil(date.getTime() / 86400000.0);
+    }
+
+    public static boolean checkType(List<Common.ColumnDesc> schema, int pos, Type.DataType type) {
+        if (pos >= schema.size()) {
+            return false;
+        }
+        Common.ColumnDesc column = schema.get(pos);
+        if (column.getDataType() != type) {
+            return false;
+        }
+        if (column.getDataType() != Type.DataType.kVarchar && column.getDataType() != Type.DataType.kString) {
+            if (CodecUtil.TYPE_SIZE_MAP.get(column.getDataType()) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public static void setStrOffset(ByteBuffer buf, int index, int strOffset, int strAddrLength) {
+        switch (strAddrLength) {
+            case 1:
+                buf.put(index, (byte) (strOffset & 0xFF));
+                break;
+            case 2:
+                buf.putShort(index, (short) (strOffset & 0xFFFF));
+                break;
+            case 3:
+                buf.put(index, (byte) (strOffset >> 16));
+                buf.put(index + 1, (byte) ((strOffset & 0xFF00) >> 8));
+                buf.put(index + 2, (byte) (strOffset & 0x00FF));
+                break;
+            default:
+                buf.putInt(index, strOffset);
+
+        }
+    }
+
+    public static int getStrOffset(ByteBuffer buf, int offset, int strAddrLength) {
+        int strOffset = 0;
+        switch (strAddrLength) {
+            case 1:
+                strOffset =  buf.get(offset) & 0xFF;
+                break;
+            case 2:
+                strOffset = buf.getShort(offset) & 0xFFFF;
+                break;
+            case 3:
+                strOffset = buf.get(offset) & 0xFF;
+                strOffset = (strOffset << 8) + (buf.get((offset + 1)) & 0xFF);
+                strOffset = (strOffset << 8) + (buf.get((offset + 2)) & 0xFF);
+                break;
+            default:
+                strOffset = buf.getInt(offset);
+        }
+        return strOffset;
+    }
+
 }

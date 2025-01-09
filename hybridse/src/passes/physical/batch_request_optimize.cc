@@ -269,6 +269,7 @@ static Status UpdateProjectExpr(
     return replacer.Replace(expr->DeepCopy(ctx->node_manager()), output);
 }
 
+// simplify simple project, remove orphan descendant producer nodes
 static Status CreateSimplifiedProject(PhysicalPlanContext* ctx,
                                       PhysicalOpNode* input,
                                       const ColumnProjects& projects,
@@ -279,8 +280,7 @@ static Status CreateSimplifiedProject(PhysicalPlanContext* ctx,
         can_project = false;
         for (size_t i = 0; i < cur_input->producers().size(); ++i) {
             auto cand_input = cur_input->GetProducer(i);
-            if (cand_input->GetOutputType() !=
-                PhysicalSchemaType::kSchemaTypeRow) {
+            if (cand_input->GetOutputType() != PhysicalSchemaType::kSchemaTypeRow) {
                 continue;
             }
             bool is_valid = true;
@@ -341,7 +341,7 @@ Status CommonColumnOptimize::ProcessSimpleProject(
             CHECK_STATUS(
                 UpdateProjectExpr(ctx, expr, input_op, new_id_map, &new_expr),
                 "Fail to resolve expr ", expr->GetExprString(),
-                " on project input:\n", new_input->SchemaToString());
+                " on project input:\n", new_input->SchemaToString(""));
             expr = new_expr;
         }
 
@@ -406,9 +406,9 @@ static Status CreateNewProject(PhysicalPlanContext* ctx, ProjectType ptype,
             break;
         }
         case ProjectType::kAggregation: {
-            PhysicalAggrerationNode* op = nullptr;
+            PhysicalAggregationNode* op = nullptr;
             CHECK_STATUS(
-                ctx->CreateOp<PhysicalAggrerationNode>(&op, input, projects, having_condition));
+                ctx->CreateOp<PhysicalAggregationNode>(&op, input, projects, having_condition));
             *out = op;
             break;
         }
@@ -424,7 +424,7 @@ Status CommonColumnOptimize::ProcessProject(PhysicalPlanContext* ctx,
                                             BuildOpState* state) {
     // process window agg
     if (project_op->project_type_ == ProjectType::kAggregation) {
-        auto window_agg_op = dynamic_cast<PhysicalAggrerationNode*>(project_op);
+        auto window_agg_op = dynamic_cast<PhysicalAggregationNode*>(project_op);
         return ProcessWindow(ctx, window_agg_op, state);
     }
 
@@ -461,7 +461,7 @@ Status CommonColumnOptimize::ProcessProject(PhysicalPlanContext* ctx,
             CHECK_STATUS(
                 UpdateProjectExpr(ctx, expr, input_op, new_id_map, &new_expr),
                 "Fail to resolve expr ", expr->GetExprString(),
-                " on project input:\n", new_input->SchemaToString());
+                " on project input:\n", new_input->SchemaToString(""));
             expr = new_expr;
         }
 
@@ -487,7 +487,9 @@ Status CommonColumnOptimize::ProcessProject(PhysicalPlanContext* ctx,
 //    const node::ExprNode* having_condition = project_op->having_condition_.condition();
     vm::ConditionFilter having_condition;
     if (project_op->project_type_ == vm::kAggregation) {
-        having_condition = dynamic_cast<vm::PhysicalAggrerationNode*>(project_op)->having_condition_;
+        auto* agg_prj = dynamic_cast<vm::PhysicalAggregationNode*>(project_op);
+        CHECK_TRUE(agg_prj != nullptr, kPlanError, "not a PhysicalAggregationNode");
+        having_condition = agg_prj->having_condition_;
     } else if (project_op->project_type_ == vm::kGroupAggregation) {
         having_condition = dynamic_cast<vm::PhysicalGroupAggrerationNode*>(project_op)->having_condition_;
     }
@@ -687,7 +689,7 @@ Status CommonColumnOptimize::ProcessRequestUnion(
 }
 
 Status CommonColumnOptimize::ProcessWindow(PhysicalPlanContext* ctx,
-                                           PhysicalAggrerationNode* agg_op,
+                                           PhysicalAggregationNode* agg_op,
                                            BuildOpState* state) {
     // find request union path
     auto input = agg_op->GetProducer(0);
@@ -758,7 +760,7 @@ Status CommonColumnOptimize::ProcessWindow(PhysicalPlanContext* ctx,
             CHECK_STATUS(
                 UpdateProjectExpr(ctx, expr, input, new_id_map, &new_expr),
                 "Fail to resolve expr ", expr->GetExprString(),
-                " on project input:\n", new_union->SchemaToString());
+                " on project input:\n", new_union->SchemaToString(""));
             expr = new_expr;
         }
         bool expr_is_common =
@@ -795,8 +797,8 @@ Status CommonColumnOptimize::ProcessWindow(PhysicalPlanContext* ctx,
         new_union == agg_op->GetProducer(0)) {
         state->common_op = agg_op;
     } else if (common_projects.size() > 0) {
-        PhysicalAggrerationNode* common_project_op = nullptr;
-        CHECK_STATUS(ctx->CreateOp<PhysicalAggrerationNode>(
+        PhysicalAggregationNode* common_project_op = nullptr;
+        CHECK_STATUS(ctx->CreateOp<PhysicalAggregationNode>(
             &common_project_op, new_union, common_projects, new_having_condition));
         state->common_op = common_project_op;
     } else {
@@ -807,8 +809,8 @@ Status CommonColumnOptimize::ProcessWindow(PhysicalPlanContext* ctx,
         new_union == agg_op->GetProducer(0)) {
         state->non_common_op = agg_op;
     } else if (non_common_projects.size() > 0) {
-        PhysicalAggrerationNode* non_common_project_op = nullptr;
-        CHECK_STATUS(ctx->CreateOp<PhysicalAggrerationNode>(
+        PhysicalAggregationNode* non_common_project_op = nullptr;
+        CHECK_STATUS(ctx->CreateOp<PhysicalAggregationNode>(
             &non_common_project_op, new_union, non_common_projects, new_having_condition));
         state->non_common_op = non_common_project_op;
     } else {
@@ -947,21 +949,16 @@ Status CommonColumnOptimize::ProcessJoin(PhysicalPlanContext* ctx,
         }
     } else if (is_non_common_join) {
         // join only depend on non-common left part
-        if (left_state->non_common_op == join_op->GetProducer(0) &&
-            right == join_op->GetProducer(1)) {
+        if (left_state->non_common_op == join_op->GetProducer(0) && right == join_op->GetProducer(1)) {
             state->common_op = nullptr;
             state->non_common_op = join_op;
         } else {
             PhysicalRequestJoinNode* new_join = nullptr;
-            CHECK_STATUS(ctx->CreateOp<PhysicalRequestJoinNode>(
-                &new_join, left_state->non_common_op, right, join_op->join(),
-                join_op->output_right_only()));
-            CHECK_STATUS(ReplaceComponentExpr(
-                join_op->join(), join_op->joined_schemas_ctx(),
-                new_join->joined_schemas_ctx(), ctx->node_manager(),
-                &new_join->join_));
-            state->common_op =
-                join_op->output_right_only() ? nullptr : left_state->common_op;
+            CHECK_STATUS(ctx->CreateOp<PhysicalRequestJoinNode>(&new_join, left_state->non_common_op, right,
+                                                                join_op->join(), join_op->output_right_only()));
+            CHECK_STATUS(ReplaceComponentExpr(join_op->join(), join_op->joined_schemas_ctx(),
+                                              new_join->joined_schemas_ctx(), ctx->node_manager(), &new_join->join_));
+            state->common_op = join_op->output_right_only() ? nullptr : left_state->common_op;
             state->non_common_op = new_join;
             if (!join_op->output_right_only()) {
                 for (size_t left_idx : left_state->common_column_indices) {

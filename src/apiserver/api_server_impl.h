@@ -18,23 +18,27 @@
 #define SRC_APISERVER_API_SERVER_IMPL_H_
 
 #include <algorithm>
+#include <charconv>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "apiserver/interface_provider.h"
 #include "apiserver/json_helper.h"
-#include "json2pb/rapidjson.h"  // rapidjson's DOM-style API
+#include "bvar/bvar.h"
+#include "bvar/multi_dimension.h"  // latency recorder
 #include "proto/api_server.pb.h"
+#include "rapidjson/document.h"  // raw rapidjson 1.1.0, not in butil
 #include "sdk/sql_cluster_router.h"
+#include "sdk/sql_request_row.h"
 
 namespace openmldb {
 namespace apiserver {
 
-using butil::rapidjson::Document;
-using butil::rapidjson::StringBuffer;
-using butil::rapidjson::Writer;
+using rapidjson::Document;
+using rapidjson::Value;
 
 // APIServer is a service for brpc::Server. The entire implement is `StartAPIServer()` in src/cmd/openmldb.cc
 // Every request is handled by `Process()`, we will choose the right method of the request by `InterfaceProvider`.
@@ -43,18 +47,18 @@ using butil::rapidjson::Writer;
 // Both input and output are json data. We use rapidjson to handle it.
 class APIServerImpl : public APIServer {
  public:
-    APIServerImpl() = default;
+    explicit APIServerImpl(const std::string& endpoint);
     ~APIServerImpl() override;
-    bool Init(const sdk::ClusterOptions& options);
+    bool Init(const std::shared_ptr<::openmldb::sdk::SQLRouterOptions>& options);
     bool Init(::openmldb::sdk::DBSDK* cluster);
     void Process(google::protobuf::RpcController* cntl_base, const HttpRequest*, HttpResponse*,
                  google::protobuf::Closure* done) override;
     static std::string InnerTypeTransform(const std::string& s);
 
-    void Refresh(google::protobuf::RpcController* cntl_base, const HttpRequest*, HttpResponse*,
-                 google::protobuf::Closure* done) override;
+    void Refresh();
 
  private:
+    void RegisterQuery();
     void RegisterPut();
     void RegisterExecSP();
     void RegisterExecDeployment();
@@ -62,37 +66,71 @@ class APIServerImpl : public APIServer {
     void RegisterGetDeployment();
     void RegisterGetDB();
     void RegisterGetTable();
+    void RegisterRefresh();
 
-    void ExecuteProcedure(bool has_common_col, const InterfaceProvider::Params& param,
-            const butil::IOBuf& req_body, JsonWriter& writer); // NOLINT
+    void ExecuteProcedure(bool has_common_col, const InterfaceProvider::Params& param, const butil::IOBuf& req_body,
+                          JsonWriter& writer);  // NOLINT
 
-    static bool Json2SQLRequestRow(const butil::rapidjson::Value& non_common_cols_v,
-                                   const butil::rapidjson::Value& common_cols_v,
-                                   std::shared_ptr<openmldb::sdk::SQLRequestRow> row);
+    static absl::Status JsonArray2SQLRequestRow(const Value& non_common_cols_v, const Value& common_cols_v,
+                                                std::shared_ptr<openmldb::sdk::SQLRequestRow> row);
+    static absl::Status JsonMap2SQLRequestRow(const Value& non_common_cols_v, const Value& common_cols_v,
+                                              std::shared_ptr<openmldb::sdk::SQLRequestRow> row);
     template <typename T>
-    static bool AppendJsonValue(const butil::rapidjson::Value& v, hybridse::sdk::DataType type, bool is_not_null,
-                                T row);
+    static bool AppendJsonValue(const Value& v, hybridse::sdk::DataType type, bool is_not_null, T row);
+
+    // may get segmentation fault when throw boost::bad_lexical_cast, so we use std::from_chars
+    template <typename T>
+    static bool FromString(const std::string& s, T& value) {  // NOLINT
+        if (auto res = std::from_chars(s.data(), s.data() + s.size(), value); res.ec == std::errc()) {
+            auto len = res.ptr - s.data();
+            return len >= 0 ? (uint64_t)len == s.size() : false;
+        } else {
+            return false;
+        }
+    }
 
  private:
-    std::shared_ptr<sdk::SQLRouter> sql_router_;
+    bvar::MultiDimension<bvar::LatencyRecorder> md_recorder_;
     InterfaceProvider provider_;
+
+    std::shared_ptr<sdk::SQLRouter> sql_router_;
     // cluster_sdk_ is not owned by this class.
     ::openmldb::sdk::DBSDK* cluster_sdk_ = nullptr;
 };
 
-struct PutResp {
-    PutResp() = default;
-    int code = 0;
-    std::string msg = "ok";
-};
+#define RETURN_AR_IF_ERROR(expr, msg)                        \
+    do {                                                     \
+        auto& _ar = (expr);                                  \
+        if (!_ar) {                                          \
+            status_.Update(absl::InvalidArgumentError(msg)); \
+            return _ar;                                      \
+        }                                                    \
+    } while (0)
+#define RETURN_AR_IF_NOT_OK(expr, _ar, msg)                  \
+    do {                                                     \
+        auto _expr = (expr);                                 \
+        if (!_expr) {                                        \
+            status_.Update(absl::InvalidArgumentError(msg)); \
+            return _ar;                                      \
+        }                                                    \
+    } while (0)
+struct QueryReq {
+    std::string mode;
+    int timeout = -1;  // only for offline jobs
+    std::string sql;
+    std::shared_ptr<openmldb::sdk::SQLRequestRow> parameter;
+    bool write_nan_and_inf_null = false;
 
-template <typename Archiver>
-Archiver& operator&(Archiver& ar, PutResp& s) {  // NOLINT
-    ar.StartObject();
-    ar.Member("code") & s.code;
-    ar.Member("msg") & s.msg;
-    return ar.EndObject();
-}
+    QueryReq(JsonReader& ar) { parse(ar); }  // NOLINT
+    absl::Status status() { return status_; }
+
+ private:
+    JsonReader& parse(JsonReader& ar);  // NOLINT
+    // we want to store errors when parsing, so make this method in class
+    JsonReader& parse(JsonReader& ar, std::shared_ptr<openmldb::sdk::SQLRequestRow>& parameter);  // NOLINT
+ private:
+    absl::Status status_;
+};
 
 struct ExecSPResp {
     ExecSPResp() = default;
@@ -100,13 +138,16 @@ struct ExecSPResp {
     std::string msg = "ok";
     std::shared_ptr<hybridse::sdk::ProcedureInfo> sp_info;
     bool need_schema = false;
+    bool json_result = false;
     std::shared_ptr<hybridse::sdk::ResultSet> rs;
+    bool write_nan_and_inf_null = false;
 };
 
 void WriteSchema(JsonWriter& ar, const std::string& name, const hybridse::sdk::Schema& schema,  // NOLINT
                  bool only_const);
 
-void WriteValue(JsonWriter& ar, std::shared_ptr<hybridse::sdk::ResultSet> rs, int i);  // NOLINT
+void WriteValue(JsonWriter& ar, std::shared_ptr<hybridse::sdk::ResultSet> rs, int i,  // NOLINT
+                bool write_nan_and_inf_null);
 
 // ExecSPResp reading is unsupported now, cuz we decode ResultSet with Schema here, it's irreversible
 JsonWriter& operator&(JsonWriter& ar, ExecSPResp& s);  // NOLINT
@@ -130,6 +171,17 @@ JsonWriter& operator&(JsonWriter& ar,  // NOLINT
                       const ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnKey>& column_key);
 
 JsonWriter& operator&(JsonWriter& ar, std::shared_ptr<::openmldb::nameserver::TableInfo> info);  // NOLINT
+
+struct QueryResp {
+    QueryResp() = default;
+    int code = 0;
+    std::string msg = "ok";
+    std::shared_ptr<hybridse::sdk::ResultSet> rs;
+    // option, won't write to result
+    bool write_nan_and_inf_null = false;
+};
+
+JsonWriter& operator&(JsonWriter& ar, QueryResp& s);  // NOLINT
 
 }  // namespace apiserver
 }  // namespace openmldb

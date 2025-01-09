@@ -17,14 +17,20 @@
 package com._4paradigm.openmldb.batch.api
 
 import com._4paradigm.openmldb.batch.catalog.OpenmldbCatalogService
+import com._4paradigm.openmldb.batch.utils.{DataTypeUtil, VersionCli}
+import com._4paradigm.openmldb.batch.utils.DataSourceUtil.autoLoad
 import com._4paradigm.openmldb.batch.{OpenmldbBatchConfig, SparkPlanner}
-import org.apache.commons.io.IOUtils
+import org.apache.commons.lang3.exception.ExceptionUtils
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.{SPARK_VERSION, SparkConf}
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import scala.collection.mutable
+import scala.collection.JavaConverters.{asScalaBufferConverter, mapAsScalaMap, mapAsScalaMapConverter}
 
 /**
  * The class to provide SparkSession-like API.
@@ -39,7 +45,7 @@ class OpenmldbSession {
   val registeredTables: mutable.Map[String, mutable.Map[String, DataFrame]] =
     mutable.HashMap[String, mutable.Map[String, DataFrame]]()
 
-  private var config: OpenmldbBatchConfig = _
+  var config: OpenmldbBatchConfig = _
 
   var planner: SparkPlanner = _
 
@@ -56,10 +62,25 @@ class OpenmldbSession {
     this.config = OpenmldbBatchConfig.fromSparkSession(sparkSession)
     this.setDefaultSparkConfig()
 
+    if (this.config.printVersion) {
+      logger.info("Print OpenMLDB version")
+      logger.info(version())
+    }
+
     if (this.config.openmldbZkCluster.nonEmpty && this.config.openmldbZkRootPath.nonEmpty) {
-      openmldbCatalogService = new OpenmldbCatalogService(this.config.openmldbZkCluster, this.config.openmldbZkRootPath,
-        config.openmldbJsdkLibraryPath)
-      registerOpenmldbOfflineTable(openmldbCatalogService)
+      logger.info(s"Try to connect OpenMLDB with zk cluster: ${this.config.openmldbZkCluster}, root path: " +
+        s"${this.config.openmldbZkRootPath}, user: ${this.config.openmldbUser}, password: " +
+        s"${this.config.openmldbPassword}")
+      try {
+        openmldbCatalogService = new OpenmldbCatalogService(this.config.openmldbZkCluster,
+          this.config.openmldbZkRootPath, this.config.openmldbUser, this.config.openmldbPassword,
+          config.openmldbJsdkLibraryPath)
+        registerOpenmldbOfflineTable(openmldbCatalogService)
+      } catch {
+        case e: Exception => logger.warn("Fail to connect OpenMLDB cluster and register tables, " + e.getMessage)
+      }
+    } else {
+      logger.warn("openmldb.zk.cluster or openmldb.zk.root.path is not set and do not register OpenMLDB tables")
     }
   }
 
@@ -99,6 +120,14 @@ class OpenmldbSession {
 
       this.sparkSession
     }
+  }
+
+  def isYarnMode(): Boolean = {
+    getSparkSession.conf.get("spark.master").equalsIgnoreCase("yarn")
+  }
+
+  def isClusterMode(): Boolean = {
+    getSparkSession.conf.get("spark.submit.deployMode", "client").equalsIgnoreCase("cluster")
   }
 
   def setDefaultSparkConfig(): Unit = {
@@ -147,7 +176,9 @@ class OpenmldbSession {
    * @return
    */
   def openmldbSql(sqlText: String): OpenmldbDataframe = {
-    if (config.disableOpenmldb) {
+    logger.info("Try to execute OpenMLDB SQL: " + sqlText)
+
+    if (config.enableSparksql) {
       return OpenmldbDataframe(this, sparksql(sqlText))
     }
 
@@ -192,16 +223,26 @@ class OpenmldbSession {
    */
   def version(): String = {
     // Read OpenMLDB git properties which is added by maven plugin
-    val stream = this.getClass.getClassLoader.getResourceAsStream("openmldb_git.properties")
-    if (stream == null) {
-      logger.error("OpenMLDB git properties is missing")
-      SPARK_VERSION
-    } else {
-      s"$SPARK_VERSION\n${IOUtils.toString(stream, "UTF-8")}"
+    try {
+      val openmldbBatchVersion = VersionCli.getVersion()
+      s"Spark: $SPARK_VERSION, OpenMLDB: $openmldbBatchVersion"
+    } catch {
+      case e: IOException => {
+        logger.warn("Fail to load OpenMLDB git properties " + e.getMessage)
+        SPARK_VERSION
+      }
     }
   }
 
   def registerTable(dbName: String, tableName: String, df: DataFrame): Unit = {
+    // Register in OpenMLDB session
+    registerTableInOpenmldbSession(dbName, tableName, df)
+
+    // Register in Spark catalog
+    df.createOrReplaceTempView(tableName)
+  }
+
+  def registerTableInOpenmldbSession(dbName: String, tableName: String, df: DataFrame): Unit = {
     if (!registeredTables.contains(dbName)) {
       registeredTables.put(dbName, new mutable.HashMap[String, DataFrame]())
     }
@@ -227,6 +268,10 @@ class OpenmldbSession {
     sparkSession.toString
   }
 
+  def disableSparkLogs(): Unit = {
+    Logger.getLogger("org").setLevel(Level.OFF)
+    Logger.getLogger("akka").setLevel(Level.OFF)
+  }
   /**
    * Stop the Spark session.
    */
@@ -237,7 +282,15 @@ class OpenmldbSession {
   def close(): Unit = stop()
 
   def registerOpenmldbOfflineTable(catalogService: OpenmldbCatalogService): Unit = {
+    if (catalogService == null) {
+      return
+    }
+
     val databases = catalogService.getDatabases
+    if (databases == null) {
+      return
+    }
+
     databases.map(dbName => {
       val tableInfos = catalogService.getTableInfos(dbName)
       tableInfos.map(tableInfo => {
@@ -247,26 +300,43 @@ class OpenmldbSession {
         if (offlineTableInfo != null) { // offlineTableInfo is always not null
           val path = offlineTableInfo.getPath
           val format = offlineTableInfo.getFormat
+          val options = offlineTableInfo.getOptionsMap.asScala.toMap
+          val symbolicPathsSize = offlineTableInfo.getSymbolicPathsCount()
+
+          val symbolicPaths = if (symbolicPathsSize > 0) {
+            offlineTableInfo.getSymbolicPathsList().asScala.toList
+          } else {
+            List.empty[String]
+          }
 
           // TODO: Ignore the register exception which occurs when switching local and yarn mode
           try {
             // default offlineTableInfo required members 'path' & 'format' won't be null
-            if (path != null && path.nonEmpty && format != null && format.nonEmpty) {
-              // Has offline table meta
-              val df = format.toLowerCase match {
-                case "parquet" => sparkSession.read.parquet(path)
-                case "csv" => sparkSession.read.csv(path)
-              }
-              // TODO: Check schema
+            if ((path != null && path.nonEmpty) || symbolicPathsSize > 0) {
+              // Has offline table meta, use the meta and table schema to read data
+              // hive load will use sparksql
+              val df = autoLoad(this, path, symbolicPaths, format, options, tableInfo.getColumnDescList)
               registerTable(dbName, tableName, df)
             } else {
               // Register empty df for table
-              logger.info(s"Register empty dataframe fof $dbName.$tableName")
-              // TODO: Create empty df with schema
-              registerTable(dbName, tableName, sparkSession.emptyDataFrame)
+              val tableInfo = catalogService.getTableInfo(dbName, tableName)
+              val columnDescList = tableInfo.getColumnDescList
+
+              val schema = new StructType(columnDescList.asScala.map(colDesc => {
+                StructField(colDesc.getName, DataTypeUtil.protoTypeToSparkType(colDesc.getDataType),
+                  !colDesc.getNotNull)
+              }).toArray)
+
+              logger.info(s"Register empty dataframe of $dbName.$tableName with schema $schema")
+              // Create empty df with schema
+              val emptyDf = sparkSession.createDataFrame(sparkSession.emptyDataFrame.rdd, schema)
+
+              registerTable(dbName, tableName, emptyDf)
             }
           } catch {
-            case e: Exception => logger.warn(s"Fail to register table $dbName.$tableName, error: ${e.getMessage}")
+            case e: Exception => {
+              logger.warn(s"Fail to register table $dbName.$tableName, exception: " + ExceptionUtils.getStackTrace(e))
+            }
           }
         }
       })

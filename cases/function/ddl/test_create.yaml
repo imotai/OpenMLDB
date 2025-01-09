@@ -14,6 +14,7 @@
 
 db: test_zw
 debugs: []
+version: 0.5.0
 cases:
   -
     id: 0
@@ -414,7 +415,6 @@ cases:
     desc: create with replica num and distribution
     mode: standalone-unsupport
     sqlDialect: ["HybridSQL"]
-    mode: standalone-unsupport
     sql: |
       create table {auto} (
       c1 string, c3 int, c4 bigint, c5 float, c6 double, c7 timestamp, c8 date,
@@ -430,7 +430,6 @@ cases:
     desc: create with replica num and distribution
     mode: standalone-unsupport
     sqlDialect: ["HybridSQL"]
-    mode: standalone-unsupport
     sql: |
       create table {auto} (
       c1 string, c3 int, c4 bigint, c5 float, c6 double, c7 timestamp, c8 date,
@@ -446,7 +445,6 @@ cases:
     desc: create with replica num and distribution
     mode: standalone-unsupport
     sqlDialect: ["HybridSQL"]
-    mode: standalone-unsupport
     sql: |
       create table {auto} (
       c1 string, c3 int, c4 bigint, c5 float, c6 double, c7 timestamp, c8 date,

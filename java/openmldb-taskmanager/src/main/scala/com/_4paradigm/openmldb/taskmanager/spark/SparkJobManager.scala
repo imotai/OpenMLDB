@@ -19,10 +19,15 @@ package com._4paradigm.openmldb.taskmanager.spark
 import com._4paradigm.openmldb.taskmanager.{JobInfoManager, LogManager}
 import com._4paradigm.openmldb.taskmanager.config.TaskManagerConfig
 import com._4paradigm.openmldb.taskmanager.dao.JobInfo
+import com._4paradigm.openmldb.taskmanager.udf.ExternalFunctionManager
 import com._4paradigm.openmldb.taskmanager.yarn.YarnClientUtil
 import org.apache.spark.launcher.SparkLauncher
+import org.slf4j.LoggerFactory
+import java.nio.file.Paths
 
 object SparkJobManager {
+
+  private val logger = LoggerFactory.getLogger(this.getClass)
 
   /**
    * Create the SparkLauncher object with pre-set parameters like yarn-cluster.
@@ -33,92 +38,147 @@ object SparkJobManager {
   def createSparkLauncher(mainClass: String): SparkLauncher = {
 
     val launcher = new SparkLauncher()
-      .setAppResource(TaskManagerConfig.BATCHJOB_JAR_PATH)
+      .setAppResource(TaskManagerConfig.getBatchjobJarPath)
       .setMainClass(mainClass)
 
-    if (TaskManagerConfig.SPARK_HOME != null && TaskManagerConfig.SPARK_HOME.nonEmpty) {
-      launcher.setSparkHome(TaskManagerConfig.SPARK_HOME)
+    if (TaskManagerConfig.getSparkHome != null && TaskManagerConfig.getSparkHome.nonEmpty) {
+      launcher.setSparkHome(TaskManagerConfig.getSparkHome)
     }
 
-    TaskManagerConfig.SPARK_MASTER.toLowerCase match {
-      case "local" => {
-        launcher.setMaster("local")
-      }
-      case "yarn" => {
-        launcher.setMaster("yarn")
-          .setDeployMode("cluster")
-      }
-      case _ => throw new Exception(s"Unsupported Spark master ${TaskManagerConfig.SPARK_MASTER}")
+    val env: java.util.Map[String, String] = new java.util.HashMap[String, String]
+    // config may empty, need check
+    if (TaskManagerConfig.getHadoopConfDir != null && TaskManagerConfig.getHadoopConfDir.nonEmpty) {
+      env.put("HADOOP_CONF_DIR", TaskManagerConfig.getHadoopConfDir)
     }
 
-    if (TaskManagerConfig.SPARK_YARN_JARS != null && TaskManagerConfig.SPARK_YARN_JARS.nonEmpty) {
-      launcher.setConf("spark.yarn.jars", TaskManagerConfig.SPARK_YARN_JARS)
+    if (TaskManagerConfig.getHadoopUserName != null && TaskManagerConfig.getHadoopUserName.nonEmpty){
+      env.put("HADOOP_USER_NAME", TaskManagerConfig.getHadoopUserName)
+    }
+
+    if (TaskManagerConfig.getSparkMaster.startsWith("local")) {
+      launcher.setMaster(TaskManagerConfig.getSparkMaster)
+    } else {
+      TaskManagerConfig.getSparkMaster.toLowerCase match {
+        case "yarn" | "yarn-cluster" =>
+          launcher.setMaster("yarn").setDeployMode("cluster")
+        case "yarn-client" =>
+          launcher.setMaster("yarn").setDeployMode("client")
+        case _ => throw new Exception(s"Unsupported Spark master ${TaskManagerConfig.getSparkMaster}")
+      }
+    }
+    
+    if (TaskManagerConfig.getSparkYarnJars != null && TaskManagerConfig.getSparkYarnJars.nonEmpty) {
+      launcher.setConf("spark.yarn.jars", TaskManagerConfig.getSparkYarnJars)
     }
 
     launcher
   }
 
-  def submitSparkJob(jobType: String, mainClass: String, args: List[String] = List(),
-                     sparkConf: Map[String, String] = Map(), defaultDb: String = ""): JobInfo = {
-    val jobInfo = JobInfoManager.createJobInfo(jobType, args, sparkConf)
+  def submitSparkJob(jobType: String, mainClass: String,
+                     args: List[String] = List(),
+                     sql: String = "",
+                     localSqlFile: String = "",
+                     sparkConf: Map[String, String] = Map(),
+                     defaultDb: String = "",
+                     blocking: Boolean = false): JobInfo = {
+
+    val jobInfoArgs = if (sql.nonEmpty) {
+      List(sql)
+    } else {
+      args
+    }
+    val jobInfo = JobInfoManager.createJobInfo(jobType, jobInfoArgs, sparkConf)
 
     // Submit Spark application with SparkLauncher
     val launcher = createSparkLauncher(mainClass)
-    if (args != null) {
+
+    if (args.nonEmpty) {
       launcher.addAppArgs(args:_*)
     }
 
+    if (localSqlFile.nonEmpty) {
+      logger.info("Add the local SQL file: " + localSqlFile)
+      launcher.addFile(localSqlFile)
+    }
+
     // TODO: Avoid using zh_CN to load openmldb jsdk so
-    launcher.setConf("spark.yarn.appMasterEnv.LANG", "en_US.UTF-8")
-    launcher.setConf("spark.yarn.appMasterEnv.LC_ALL", "en_US.UTF-8")
-    launcher.setConf("spark.yarn.executorEnv.LANG", "en_US.UTF-8")
-    launcher.setConf("spark.yarn.executorEnv.LC_ALL", "en_US.UTF-8")
-
-    if (TaskManagerConfig.SPARK_EVENTLOG_DIR.nonEmpty) {
+   
+    if (TaskManagerConfig.getSparkEventlogDir.nonEmpty) {
       launcher.setConf("spark.eventLog.enabled", "true")
-      launcher.setConf("spark.eventLog.dir", TaskManagerConfig.SPARK_EVENTLOG_DIR)
+      launcher.setConf("spark.eventLog.dir", TaskManagerConfig.getSparkEventlogDir)
     }
 
-    if (TaskManagerConfig.SPARK_YARN_MAXAPPATTEMPTS != null) {
-      launcher.setConf("spark.yarn.maxAppAttempts", TaskManagerConfig.SPARK_YARN_MAXAPPATTEMPTS.toString)
+    if (TaskManagerConfig.getSparkYarnMaxappattempts >= 1 ) {
+      launcher.setConf("spark.yarn.maxAppAttempts", TaskManagerConfig.getSparkYarnMaxappattempts.toString)
     }
 
-    // TODO: Support escape delimiter
     // Set default Spark conf by TaskManager configuration file
-    val defaultSparkConfs = TaskManagerConfig.SPARK_DEFAULT_CONF.split(",")
+    val defaultSparkConfs = TaskManagerConfig.getSparkDefaultConf.split(";")
     defaultSparkConfs.map(sparkConf => {
       if (sparkConf.nonEmpty) {
         val kvList = sparkConf.split("=")
-        launcher.setConf(kvList(0), kvList(1))
+        val key = kvList(0)
+        val value = kvList.drop(1).mkString("=")
+        launcher.setConf(key, value)
       }
     })
 
     // Set ZooKeeper config for openmldb-batch jobs
-    if (TaskManagerConfig.ZK_CLUSTER.nonEmpty && TaskManagerConfig.ZK_ROOT_PATH.nonEmpty) {
-      launcher.setConf("spark.openmldb.zk.cluster", TaskManagerConfig.ZK_CLUSTER)
-      launcher.setConf("spark.openmldb.zk.root.path", TaskManagerConfig.ZK_ROOT_PATH)
+    if (TaskManagerConfig.getZkCluster.nonEmpty && TaskManagerConfig.getZkRootPath.nonEmpty) {
+      launcher.setConf("spark.openmldb.zk.cluster", TaskManagerConfig.getZkCluster)
+      launcher.setConf("spark.openmldb.zk.root.path", TaskManagerConfig.getZkRootPath)
+
+      launcher.setConf("spark.openmldb.user", TaskManagerConfig.getUser)
+      launcher.setConf("spark.openmldb.password", TaskManagerConfig.getPassword)
     }
 
     // Set ad-hoc Spark configuration
     if (defaultDb.nonEmpty) {
       launcher.setConf("spark.openmldb.default.db", defaultDb)
     }
-    if (TaskManagerConfig.OFFLINE_DATA_PREFIX.nonEmpty) {
-      launcher.setConf("spark.openmldb.offline.data.prefix", TaskManagerConfig.OFFLINE_DATA_PREFIX)
+
+    if (TaskManagerConfig.getOfflineDataPrefix.nonEmpty) {
+      launcher.setConf("spark.openmldb.offline.data.prefix", TaskManagerConfig.getOfflineDataPrefix)
     }
+
+    // Set external function dir for offline jobs
+    val absoluteExternalFunctionDir = if (TaskManagerConfig.getExternalFunctionDir.startsWith("/")) {
+      TaskManagerConfig.getExternalFunctionDir
+    } else {
+      // TODO: The current path is incorrect if running in IDE, please set `external.function.dir` with absolute path
+      // Concat to generate absolute path
+      Paths.get(Paths.get(".").toAbsolutePath.toString, TaskManagerConfig.getExternalFunctionDir).toString
+    }
+    launcher.setConf("spark.openmldb.taskmanager.external.function.dir", absoluteExternalFunctionDir)
+
     for ((k, v) <- sparkConf) {
+      logger.info("Get Spark config key: " + k + ", value: " + v)
       launcher.setConf(k, v)
     }
 
-    if (TaskManagerConfig.JOB_LOG_PATH.nonEmpty) {
-      // Create local file and redirect the log of job into single file
-      val jobLogFile = LogManager.getJobLogFile(jobInfo.getId)
-      launcher.redirectOutput(jobLogFile)
-      launcher.redirectError(jobLogFile)
+    if (TaskManagerConfig.getJobLogPath.nonEmpty) {
+      // Create local file and redirect the log of job into files
+      launcher.redirectOutput(LogManager.getJobLogFile(jobInfo.getId))
+      launcher.redirectError(LogManager.getJobErrorLogFile(jobInfo.getId))
     }
 
+    if(TaskManagerConfig.getEnableHiveSupport) {
+      launcher.setConf("spark.sql.catalogImplementation", "hive")
+    }
+
+    // Add the external function library files
+    // TODO(tobe): Handle the same file names
+    ExternalFunctionManager.getAllLibraryFilePaths().forEach(filePath => launcher.addFile(filePath))
+
     // Submit Spark application and watch state with custom listener
-    launcher.startApplication(new SparkJobListener(jobInfo))
+    val sparkAppHandler = launcher.startApplication(new SparkJobListener(jobInfo))
+
+    if (blocking) {
+      while (!sparkAppHandler.getState().isFinal()) {
+        // TODO: Make this configurable
+        Thread.sleep(3000L)
+      }
+    }
 
     jobInfo
   }

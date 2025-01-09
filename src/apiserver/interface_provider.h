@@ -32,6 +32,7 @@
 #include "apiserver/json_helper.h"
 #include "brpc/http_method.h"  // HttpMethod
 #include "butil/iobuf.h"       // IOBuf
+#include "bvar/bvar.h"         // latency recorder
 #include "proto/api_server.pb.h"
 
 namespace openmldb {
@@ -111,7 +112,7 @@ class ReducedUrlParser {
 
 class InterfaceProvider {
  public:
-    InterfaceProvider() = default;
+    explicit InterfaceProvider(const std::string& metric_prefix) : route_recorder_(metric_prefix, "http_route") {}
     InterfaceProvider& operator=(InterfaceProvider const&) = delete;
     InterfaceProvider(InterfaceProvider const&) = delete;
 
@@ -160,22 +161,32 @@ class InterfaceProvider {
     void registerRequest(brpc::HttpMethod, const std::string& path, std::function<func>&& callback);
 
  private:
+    // we only record route latency, method latency is recorded in callback(you may need record in parts), defined in
+    // api server impl
+    bvar::LatencyRecorder route_recorder_;
     std::unordered_map<int, std::vector<BuiltRequest>> requests_;
 };
 
-struct GeneralError {
-    GeneralError() = default;
-    explicit GeneralError(std::string m) : msg(std::move(m)) {}
-    GeneralError& Set(std::string m) {
+struct GeneralResp {
+    GeneralResp() = default;
+    explicit GeneralResp(std::string m) : msg(std::move(m)) {}
+    // If set err message without code, code will be -1
+    GeneralResp& Set(std::string m) {
         msg = std::move(m);
+        code = -1;
         return *this;
     }
-    int code = -1;
-    std::string msg;
+    GeneralResp& Set(int c, std::string m) {
+        msg = std::move(m);
+        code = c;
+        return *this;
+    }
+    int code = 0;
+    std::string msg = "ok";
 };
 
 template <typename Archiver>
-Archiver& operator&(Archiver& ar, GeneralError& s) {  // NOLINT
+Archiver& operator&(Archiver& ar, GeneralResp& s) {  // NOLINT
     ar.StartObject();
     ar.Member("code") & s.code;
     ar.Member("msg") & s.msg;

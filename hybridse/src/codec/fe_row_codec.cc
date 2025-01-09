@@ -15,10 +15,17 @@
  */
 
 #include "codec/fe_row_codec.h"
+
 #include <string>
 #include <utility>
+
+#include "absl/status/status.h"
+#include "absl/strings/str_join.h"
 #include "codec/type_codec.h"
+#include "codegen/insert_row_builder.h"
+#include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "proto/fe_common.pb.h"
 
 DECLARE_bool(enable_spark_unsaferow_format);
 
@@ -34,7 +41,7 @@ const uint32_t BitMapSize(uint32_t size) {
     }
 }
 
-const std::unordered_map<::hybridse::type::Type, uint8_t>&
+static const std::unordered_map<::hybridse::type::Type, uint8_t>&
     DEFAULT_TYPE_SIZE_MAP = {{::hybridse::type::kBool, sizeof(bool)},
                              {::hybridse::type::kInt16, sizeof(int16_t)},
                              {::hybridse::type::kInt32, sizeof(int32_t)},
@@ -44,7 +51,7 @@ const std::unordered_map<::hybridse::type::Type, uint8_t>&
                              {::hybridse::type::kDate, sizeof(int32_t)},
                              {::hybridse::type::kDouble, sizeof(double)}};
 
-const std::unordered_map<::hybridse::type::Type, uint8_t>&
+static const std::unordered_map<::hybridse::type::Type, uint8_t>&
     SPARK_UNSAFEROW_TYPE_SIZE_MAP = {
         {::hybridse::type::kBool, 8},  {::hybridse::type::kInt16, 8},
         {::hybridse::type::kInt32, 8}, {::hybridse::type::kFloat, 8},
@@ -59,6 +66,78 @@ const std::unordered_map<::hybridse::type::Type, uint8_t>& GetTypeSizeMap() {
     }
 }
 
+bool IsCodecBaseType(const type::ColumnSchema& sc) {
+    auto& map = GetTypeSizeMap();
+    return sc.has_base_type() && map.find(sc.base_type()) != map.end();
+}
+
+bool IsCodecStrLikeType(const type::ColumnSchema& sc) {
+    return sc.has_map_type() || sc.has_array_type() || (sc.has_base_type() && sc.base_type() == type::kVarchar);
+}
+
+static absl::Status ColumnSchemaStr(std::ostream& os, const type::ColumnSchema& cs) {
+    if (cs.has_base_type()) {
+        switch (cs.base_type()) {
+            case type::kInt16:
+                os << "smallint";
+                break;
+            case type::kInt32:
+                os << "int";
+                break;
+            case type::kInt64:
+                os << "bigint";
+                break;
+            case type::kFloat:
+                os << "float";
+                break;
+            case type::kDouble:
+                os << "double";
+                break;
+            case type::kVarchar:
+                os << "string";
+                break;
+            case type::kTimestamp:
+                os << "timestamp";
+                break;
+            case type::kDate:
+                os << "date";
+                break;
+            case type::kBool:
+                os << "bool";
+                break;
+            case type::kNull:
+                os << "null";
+                break;
+            default:
+                return absl::UnimplementedError(absl::StrCat("un-support tostring: ", cs.DebugString()));
+        }
+    } else if (cs.has_array_type()) {
+        os << "ARRAY<";
+        CHECK_ABSL_STATUS(ColumnSchemaStr(os, cs.array_type().ele_type()));
+        os << ">";
+    } else if (cs.has_map_type()) {
+        os << "MAP<";
+        CHECK_ABSL_STATUS(ColumnSchemaStr(os, cs.map_type().key_type()));
+        os << ", ";
+        CHECK_ABSL_STATUS(ColumnSchemaStr(os, cs.map_type().value_type()));
+        os << ">";
+    } else {
+        return absl::UnimplementedError(absl::StrCat("un-support tostring: ", cs.DebugString()));
+    }
+
+    if (cs.is_not_null()) {
+        os << " NOT NULL";
+    }
+
+    return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> ColumnSchemaStr(const type::ColumnSchema& cs) {
+    std::stringstream ss;
+    CHECK_ABSL_STATUS(ColumnSchemaStr(ss, cs));
+    return ss.str();
+}
+
 RowBuilder::RowBuilder(const Schema& schema)
     : schema_(schema),
       buf_(NULL),
@@ -71,15 +150,25 @@ RowBuilder::RowBuilder(const Schema& schema)
     str_field_start_offset_ = HEADER_LENGTH + BitMapSize(schema.size());
     for (int idx = 0; idx < schema.size(); idx++) {
         const ::hybridse::type::ColumnDef& column = schema.Get(idx);
-        if (column.type() == ::hybridse::type::kVarchar) {
-            offset_vec_.push_back(str_field_cnt_);
+        type::ColumnSchema col_schema;
+        if (column.has_schema()) {
+            col_schema = column.schema();
+        } else {
+            col_schema.set_base_type(column.type());
+        }
+        if (IsCodecStrLikeType(col_schema)) {
+            if (FLAGS_enable_spark_unsaferow_format) {
+                offset_vec_.push_back(str_field_start_offset_);
+                str_field_start_offset_ += 8;
+            } else {
+                offset_vec_.push_back(str_field_cnt_);
+            }
             str_field_cnt_++;
         } else {
-            auto TYPE_SIZE_MAP = GetTypeSizeMap();
-            auto iter = TYPE_SIZE_MAP.find(column.type());
+            auto& TYPE_SIZE_MAP = GetTypeSizeMap();
+            auto iter = TYPE_SIZE_MAP.find(col_schema.base_type());
             if (iter == TYPE_SIZE_MAP.end()) {
-                LOG(WARNING) << ::hybridse::type::Type_Name(column.type())
-                             << " is not supported";
+                LOG(WARNING) << col_schema.DebugString() << " is not supported";
             } else {
                 offset_vec_.push_back(str_field_start_offset_);
                 str_field_start_offset_ += iter->second;
@@ -106,7 +195,11 @@ bool RowBuilder::SetBuffer(int8_t* buf, uint32_t size) {
     memset(buf_ + HEADER_LENGTH, 0, bitmap_size);
     cnt_ = 0;
     str_addr_length_ = GetAddrLength(size);
-    str_offset_ = str_field_start_offset_ + str_addr_length_ * str_field_cnt_;
+    if (FLAGS_enable_spark_unsaferow_format) {
+        str_offset_ = str_field_start_offset_;
+    } else {
+        str_offset_ = str_field_start_offset_ + str_addr_length_ * str_field_cnt_;
+    }
     return true;
 }
 
@@ -146,7 +239,7 @@ bool RowBuilder::Check(::hybridse::type::Type type) {
         return false;
     }
     if (column.type() != ::hybridse::type::kVarchar) {
-        auto TYPE_SIZE_MAP = GetTypeSizeMap();
+        auto& TYPE_SIZE_MAP = GetTypeSizeMap();
         auto iter = TYPE_SIZE_MAP.find(column.type());
         if (iter == TYPE_SIZE_MAP.end()) {
             LOG(WARNING) << ::hybridse::type::Type_Name(column.type())
@@ -159,28 +252,38 @@ bool RowBuilder::Check(::hybridse::type::Type type) {
 
 void FillNullStringOffset(int8_t* buf, uint32_t start, uint32_t addr_length,
                           uint32_t str_idx, uint32_t str_offset) {
-    auto ptr = buf + start + addr_length * str_idx;
-    if (addr_length == 1) {
-        *(reinterpret_cast<uint8_t*>(ptr)) = (uint8_t)str_offset;
-    } else if (addr_length == 2) {
-        *(reinterpret_cast<uint16_t*>(ptr)) = (uint16_t)str_offset;
-    } else if (addr_length == 3) {
-        *(reinterpret_cast<uint8_t*>(ptr)) = str_offset >> 16;
-        *(reinterpret_cast<uint8_t*>(ptr + 1)) = (str_offset & 0xFF00) >> 8;
-        *(reinterpret_cast<uint8_t*>(ptr + 2)) = str_offset & 0x00FF;
+    if (FLAGS_enable_spark_unsaferow_format) {
+        // Do not update row pointer for UnsafeRowOpt
     } else {
-        *(reinterpret_cast<uint32_t*>(ptr)) = str_offset;
+        auto ptr = buf + start + addr_length * str_idx;
+        if (addr_length == 1) {
+            *(reinterpret_cast<uint8_t*>(ptr)) = (uint8_t)str_offset;
+        } else if (addr_length == 2) {
+            *(reinterpret_cast<uint16_t*>(ptr)) = (uint16_t)str_offset;
+        } else if (addr_length == 3) {
+            *(reinterpret_cast<uint8_t*>(ptr)) = str_offset >> 16;
+            *(reinterpret_cast<uint8_t*>(ptr + 1)) = (str_offset & 0xFF00) >> 8;
+            *(reinterpret_cast<uint8_t*>(ptr + 2)) = str_offset & 0x00FF;
+        } else {
+            *(reinterpret_cast<uint32_t*>(ptr)) = str_offset;
+        }
     }
 }
 
 bool RowBuilder::AppendNULL() {
     int8_t* ptr = buf_ + HEADER_LENGTH + (cnt_ >> 3);
     *(reinterpret_cast<uint8_t*>(ptr)) |= 1 << (cnt_ & 0x07);
-    const ::hybridse::type::ColumnDef& column = schema_.Get(cnt_);
-    if (column.type() == ::hybridse::type::kVarchar) {
-        FillNullStringOffset(buf_, str_field_start_offset_, str_addr_length_,
-                             offset_vec_[cnt_], str_offset_);
+
+    if (FLAGS_enable_spark_unsaferow_format) {
+        // Do not fill null for UnsafeRowOpt
+    } else {
+        const ::hybridse::type::ColumnDef& column = schema_.Get(cnt_);
+        if (column.type() == ::hybridse::type::kVarchar) {
+            FillNullStringOffset(buf_, str_field_start_offset_, str_addr_length_,
+                                 offset_vec_[cnt_], str_offset_);
+        }
     }
+
     cnt_++;
     return true;
 }
@@ -221,11 +324,17 @@ bool RowBuilder::AppendDate(int32_t year, int32_t month, int32_t day) {
     if (month < 1 || month > 12) return false;
     if (day < 1 || day > 31) return false;
     if (!Check(::hybridse::type::kDate)) return false;
-    int8_t* ptr = buf_ + offset_vec_[cnt_];
+
     int32_t data = (year - 1900) << 16;
     data = data | ((month - 1) << 8);
     data = data | day;
-    *(reinterpret_cast<int32_t*>(ptr)) = data;
+    return AppendDate(data);
+}
+
+bool RowBuilder::AppendDate(int32_t date) {
+    if (!Check(::hybridse::type::kDate)) return false;
+    int8_t* ptr = buf_ + offset_vec_[cnt_];
+    *(reinterpret_cast<int32_t*>(ptr)) = date;
     cnt_++;
     return true;
 }
@@ -257,22 +366,31 @@ bool RowBuilder::AppendDouble(double val) {
 bool RowBuilder::AppendString(const char* val, uint32_t length) {
     if (val == NULL || !Check(::hybridse::type::kVarchar)) return false;
     if (str_offset_ + length > size_) return false;
-    int8_t* ptr =
-        buf_ + str_field_start_offset_ + str_addr_length_ * offset_vec_[cnt_];
-    if (str_addr_length_ == 1) {
-        *(reinterpret_cast<uint8_t*>(ptr)) = (uint8_t)str_offset_;
-    } else if (str_addr_length_ == 2) {
-        *(reinterpret_cast<uint16_t*>(ptr)) = (uint16_t)str_offset_;
-    } else if (str_addr_length_ == 3) {
-        *(reinterpret_cast<uint8_t*>(ptr)) = str_offset_ >> 16;
-        *(reinterpret_cast<uint8_t*>(ptr + 1)) = (str_offset_ & 0xFF00) >> 8;
-        *(reinterpret_cast<uint8_t*>(ptr + 2)) = str_offset_ & 0x00FF;
+
+    if (FLAGS_enable_spark_unsaferow_format) {
+        int8_t* ptr = buf_ + offset_vec_[cnt_];
+        *(reinterpret_cast<uint32_t*>(ptr)) = length;
+        *(reinterpret_cast<uint32_t*>(ptr + 4)) = str_offset_ - HEADER_LENGTH;
     } else {
-        *(reinterpret_cast<uint32_t*>(ptr)) = str_offset_;
+        int8_t* ptr =
+            buf_ + str_field_start_offset_ + str_addr_length_ * offset_vec_[cnt_];
+        if (str_addr_length_ == 1) {
+            *(reinterpret_cast<uint8_t*>(ptr)) = (uint8_t)str_offset_;
+        } else if (str_addr_length_ == 2) {
+            *(reinterpret_cast<uint16_t*>(ptr)) = (uint16_t)str_offset_;
+        } else if (str_addr_length_ == 3) {
+            *(reinterpret_cast<uint8_t*>(ptr)) = str_offset_ >> 16;
+            *(reinterpret_cast<uint8_t*>(ptr + 1)) = (str_offset_ & 0xFF00) >> 8;
+            *(reinterpret_cast<uint8_t*>(ptr + 2)) = str_offset_ & 0x00FF;
+        } else {
+            *(reinterpret_cast<uint32_t*>(ptr)) = str_offset_;
+        }
     }
+
     if (length != 0) {
         memcpy(reinterpret_cast<char*>(buf_ + str_offset_), val, length);
     }
+
     str_offset_ += length;
     cnt_++;
     return true;
@@ -329,15 +447,25 @@ bool RowView::Init() {
     uint32_t offset = HEADER_LENGTH + BitMapSize(schema_.size());
     for (int idx = 0; idx < schema_.size(); idx++) {
         const ::hybridse::type::ColumnDef& column = schema_.Get(idx);
-        if (column.type() == ::hybridse::type::kVarchar) {
-            offset_vec_.push_back(string_field_cnt_);
+        type::ColumnSchema schema;
+        if (!column.has_schema()) {
+            schema.set_base_type(column.type());
+        } else {
+            schema = column.schema();
+        }
+        if (IsCodecStrLikeType(schema)) {
+            if (FLAGS_enable_spark_unsaferow_format) {
+                offset_vec_.push_back(offset);
+                offset += 8;
+            } else {
+                offset_vec_.push_back(string_field_cnt_);
+            }
             string_field_cnt_++;
         } else {
-            auto TYPE_SIZE_MAP = GetTypeSizeMap();
-            auto iter = TYPE_SIZE_MAP.find(column.type());
+            auto& TYPE_SIZE_MAP = GetTypeSizeMap();
+            auto iter = TYPE_SIZE_MAP.find(schema.base_type());
             if (iter == TYPE_SIZE_MAP.end()) {
-                LOG(WARNING) << ::hybridse::type::Type_Name(column.type())
-                             << " is not supported";
+                LOG(WARNING) << schema.DebugString() << " is not supported";
                 is_valid_ = false;
                 return false;
             } else {
@@ -449,6 +577,7 @@ std::string RowView::GetStringUnsafe(uint32_t idx) {
     }
     const char* val;
     uint32_t length;
+
     v1::GetStrFieldUnsafe(row_, idx, field_offset, next_str_field_offset,
                           str_field_start_offset_, str_addr_length_, &val,
                           &length);
@@ -591,7 +720,7 @@ int32_t RowView::GetDate(uint32_t idx, int32_t* year, int32_t* month,
         return 1;
     }
     int32_t date = GetDateUnsafe(idx);
-    codec::Date::Decode(date, year, month, day);
+    openmldb::base::Date::Decode(date, year, month, day);
     return 0;
 }
 int32_t RowView::GetInteger(const int8_t* row, uint32_t idx,
@@ -721,105 +850,112 @@ std::string RowView::GetAsString(uint32_t idx) {
         return "NULL";
     }
     const ::hybridse::type::ColumnDef& column = schema_.Get(idx);
-    switch (column.type()) {
-        case hybridse::type::kInt32: {
-            int32_t value;
-            if (0 == GetInt32(idx, &value)) {
-                return std::to_string(value);
+    type::ColumnSchema sc;
+    if (column.has_schema()) {
+        sc = column.schema();
+    } else {
+        sc.set_base_type(column.type());
+    }
+    if (sc.has_map_type()) {
+        return "map{...}";
+    } else if (sc.has_array_type()) {
+        return "array[ ... ]";
+    } else if (sc.has_base_type()) {
+        switch (sc.base_type()) {
+            case hybridse::type::kInt32: {
+                int32_t value;
+                if (0 == GetInt32(idx, &value)) {
+                    return std::to_string(value);
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kInt64: {
-            int64_t value;
-            if (0 == GetInt64(idx, &value)) {
-                return std::to_string(value);
+            case hybridse::type::kInt64: {
+                int64_t value;
+                if (0 == GetInt64(idx, &value)) {
+                    return std::to_string(value);
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kInt16: {
-            int16_t value;
-            if (0 == GetInt16(idx, &value)) {
-                return std::to_string(value);
+            case hybridse::type::kInt16: {
+                int16_t value;
+                if (0 == GetInt16(idx, &value)) {
+                    return std::to_string(value);
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kFloat: {
-            float value;
-            if (0 == GetFloat(idx, &value)) {
-                return std::to_string(value);
+            case hybridse::type::kFloat: {
+                float value;
+                if (0 == GetFloat(idx, &value)) {
+                    return std::to_string(value);
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kDouble: {
-            double value;
-            if (0 == GetDouble(idx, &value)) {
-                return std::to_string(value);
+            case hybridse::type::kDouble: {
+                double value;
+                if (0 == GetDouble(idx, &value)) {
+                    return std::to_string(value);
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kBool: {
-            bool value;
-            if (0 == GetBool(idx, &value)) {
-                return value ? "true" : "false";
+            case hybridse::type::kBool: {
+                bool value;
+                if (0 == GetBool(idx, &value)) {
+                    return value ? "true" : "false";
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kVarchar: {
-            const char* str = nullptr;
-            uint32_t str_size;
-            int32_t ret = GetString(idx, &str, &str_size);
-            if (0 == ret) {
-                if (str_size > 4096) {
-                    LOG(ERROR) << "Invalid String: string size exceed max "
-                                  "string size 4096, trunk string"
-                               << "size_ = " << size_
+            case hybridse::type::kVarchar: {
+                const char* str = nullptr;
+                uint32_t str_size;
+                int32_t ret = GetString(idx, &str, &str_size);
+                if (0 == ret) {
+                    if (str_size > 4096) {
+                        LOG(ERROR) << "Invalid String: string size exceed max "
+                                      "string size 4096, trunk string"
+                                   << "size_ = " << size_
+                                   << " *(reinterpret_cast<const uint32_t*>(row + "
+                                      "VERSION_LENGTH)) = "
+                                   << *(reinterpret_cast<const uint32_t*>(row_ + VERSION_LENGTH));
+                        return std::string(str, 4096);
+                    }
+                    return std::string(str, str_size);
+                } else {
+                    LOG(ERROR) << "fail to get string: ret = " << ret << "size_ = " << size_
                                << " *(reinterpret_cast<const uint32_t*>(row + "
                                   "VERSION_LENGTH)) = "
-                               << *(reinterpret_cast<const uint32_t*>(
-                                      row_ + VERSION_LENGTH));
-                    return std::string(str, 4096);
+                               << *(reinterpret_cast<const uint32_t*>(row_ + VERSION_LENGTH));
                 }
-                return std::string(str, str_size);
-            } else {
-                LOG(ERROR) << "fail to get string: ret = " << ret
-                           << "size_ = " << size_
-                           << " *(reinterpret_cast<const uint32_t*>(row + "
-                              "VERSION_LENGTH)) = "
-                           << *(reinterpret_cast<const uint32_t*>(
-                                  row_ + VERSION_LENGTH));
+                break;
             }
-            break;
-        }
-        case hybridse::type::kTimestamp: {
-            int64_t value;
-            if (0 == GetTimestamp(idx, &value)) {
-                return std::to_string(value);
+            case hybridse::type::kTimestamp: {
+                int64_t value;
+                if (0 == GetTimestamp(idx, &value)) {
+                    return std::to_string(value);
+                }
+                break;
             }
-            break;
-        }
-        case hybridse::type::kDate: {
-            int32_t year;
-            int32_t month;
-            int32_t day;
-            if (0 == GetDate(idx, &year, &month, &day)) {
-                char date[11];
-                snprintf(date, 11u, "%4d-%.2d-%.2d", year, month, day);
-                return std::string(date);
+            case hybridse::type::kDate: {
+                int32_t year;
+                int32_t month;
+                int32_t day;
+                if (0 == GetDate(idx, &year, &month, &day)) {
+                    char date[11];
+                    snprintf(date, 11u, "%4d-%.2d-%.2d", year, month, day);
+                    return std::string(date);
+                }
+                break;
             }
-            break;
-        }
-        default: {
-            LOG(WARNING) << "fail to get string for "
-                            "current row";
-            break;
+            default: {
+                break;
+            }
         }
     }
 
+    LOG(WARNING) << "fail to get string for current row";
     return "NA";
 }
 
-int32_t RowView::GetValue(const int8_t* row, uint32_t idx, const char** val,
-                          uint32_t* length) const {
+int32_t RowView::GetValue(const int8_t* row, uint32_t idx, const char** val, uint32_t* length) const {
     if (schema_.size() == 0 || row == NULL || length == NULL) {
         return -1;
     }
@@ -846,6 +982,7 @@ int32_t RowView::GetValue(const int8_t* row, uint32_t idx, const char** val,
     if (offset_vec_.at(idx) < string_field_cnt_ - 1) {
         next_str_field_offset = field_offset + 1;
     }
+
     return v1::GetStrFieldUnsafe(row, idx, field_offset, next_str_field_offset,
                                  str_field_start_offset_, GetAddrLength(size),
                                  val, length);
@@ -877,7 +1014,7 @@ int32_t RowView::GetString(uint32_t idx, const char** val, uint32_t* length) {
                                  length);
 }
 
-RowFormat::RowFormat(const hybridse::codec::Schema* schema)
+SliceFormat::SliceFormat(const hybridse::codec::Schema* schema)
     : schema_(schema), infos_(), next_str_pos_(), str_field_start_offset_(0) {
     if (nullptr == schema) {
         return;
@@ -886,30 +1023,45 @@ RowFormat::RowFormat(const hybridse::codec::Schema* schema)
     uint32_t string_field_cnt = 0;
     for (int32_t i = 0; i < schema_->size(); i++) {
         const ::hybridse::type::ColumnDef& column = schema_->Get(i);
-        if (column.type() == ::hybridse::type::kVarchar) {
-            infos_.push_back(
-                ColInfo(column.name(), column.type(), i, string_field_cnt));
-            infos_dict_[column.name()] = i;
-            next_str_pos_.insert(
-                std::make_pair(string_field_cnt, string_field_cnt));
-            string_field_cnt += 1;
+
+        // we've constructed the ColumnDef::schema field in general compile path,
+        // so it should generally not empty. however this compatibility check is still
+        // necessary since many unit tests do not take care of the new field.
+        type::ColumnSchema col_schema;
+        if (column.has_schema()) {
+            col_schema = column.schema();
         } else {
-            auto TYPE_SIZE_MAP = codec::GetTypeSizeMap();
-            auto it = TYPE_SIZE_MAP.find(column.type());
-            if (it == TYPE_SIZE_MAP.end()) {
-                LOG(WARNING) << "fail to find column type "
-                             << ::hybridse::type::Type_Name(column.type());
+            col_schema.set_base_type(column.type());
+        }
+        if (IsCodecStrLikeType(col_schema)) {
+            if (FLAGS_enable_spark_unsaferow_format) {
+                infos_.emplace_back(column.name(), col_schema, i, offset);
             } else {
-                infos_.push_back(
-                    ColInfo(column.name(), column.type(), i, offset));
+                infos_.emplace_back(column.name(), col_schema, i, string_field_cnt);
+            }
+
+            infos_dict_[column.name()] = i;
+            next_str_pos_.emplace(string_field_cnt, string_field_cnt);
+            string_field_cnt += 1;
+
+            if (FLAGS_enable_spark_unsaferow_format) {
+                // For UnsafeRowOpt, the offset should be added for string and non-string columns
+                offset += 8;
+            }
+        } else {
+            auto& TYPE_SIZE_MAP = codec::GetTypeSizeMap();
+            auto it = TYPE_SIZE_MAP.find(col_schema.base_type());
+            if (it == TYPE_SIZE_MAP.end()) {
+                LOG(WARNING) << "fail to find column type " << col_schema.DebugString();
+            } else {
+                infos_.emplace_back(column.name(), col_schema, i, offset);
                 infos_dict_[column.name()] = i;
                 offset += it->second;
             }
         }
     }
     uint32_t next_pos = 0;
-    for (auto iter = next_str_pos_.rbegin(); iter != next_str_pos_.rend();
-         iter++) {
+    for (auto iter = next_str_pos_.rbegin(); iter != next_str_pos_.rend(); iter++) {
         uint32_t tmp = iter->second;
         iter->second = next_pos;
         next_pos = tmp;
@@ -917,45 +1069,135 @@ RowFormat::RowFormat(const hybridse::codec::Schema* schema)
     str_field_start_offset_ = offset;
 }
 
-const ColInfo* RowFormat::GetColumnInfo(size_t idx) const {
+const ColInfo* SliceFormat::GetColumnInfo(size_t idx) const {
     return idx < infos_.size() ? &infos_[idx] : nullptr;
 }
 
-bool RowFormat::GetStringColumnInfo(size_t idx, StringColInfo* res) const {
-    if (nullptr == res) {
-        LOG(WARNING) << "input args have null";
-        return false;
-    }
+absl::StatusOr<StringColInfo> SliceFormat::GetStringColumnInfo(size_t idx) const {
     if (idx >= infos_.size()) {
-        return false;
+        return absl::NotFoundError("schemas empty");
     }
     // TODO(wangtaize) support null check
     auto& base_col_info = infos_[idx];
-    auto ty = base_col_info.type;
     uint32_t col_idx = base_col_info.idx;
     uint32_t offset = base_col_info.offset;
-    uint32_t next_offset;
+    uint32_t next_offset = -1;
     auto nit = next_str_pos_.find(offset);
     if (nit != next_str_pos_.end()) {
         next_offset = nit->second;
     } else {
-        LOG(WARNING) << "fail to get string field next offset";
-        return false;
+        if (FLAGS_enable_spark_unsaferow_format) {
+            // No need to get next offset for UnsafeRowOpt and ignore the warning
+        } else {
+            return absl::NotFoundError("fail to get string field next offset");
+        }
     }
     DLOG(INFO) << "get string with offset " << offset << " next offset "
                << next_offset << " str_field_start_offset "
                << str_field_start_offset_ << " for col " << base_col_info.name;
 
-    if (FLAGS_enable_spark_unsaferow_format) {
-        // Notice that we pass the nullbitmap size as str_field_start_offset
-        *res = StringColInfo(base_col_info.name, ty, col_idx, offset, next_offset,
-                            BitMapSize(schema_->size()));
-    } else {
-        *res = StringColInfo(base_col_info.name, ty, col_idx, offset, next_offset,
-                            str_field_start_offset_);
-    }
-    return true;
+    return StringColInfo(base_col_info.name, base_col_info.schema, col_idx, offset, next_offset,
+                         str_field_start_offset_);
 }
 
+SliceBuilder::SliceBuilder(vm::HybridSeJitWrapper* jit, const hybridse::codec::Schema* schema)
+    : schema_(schema) {
+    row_builder_ = std::make_shared<codegen::InsertRowBuilder>(jit, schema_);
+}
+
+base::Status SliceBuilder::Build(const std::vector<node::ExprNode* >& values, base::RefCountedSlice* slice) {
+    return Build(absl::MakeSpan(values), slice);
+}
+
+base::Status SliceBuilder::Build(absl::Span<node::ExprNode* const> values, base::RefCountedSlice* slice) {
+    EnsureInitialized();
+
+    auto rs = row_builder_->ComputeRowUnsafe(values);
+    if (!rs.ok()) {
+        return {common::kCodegenEncodeError, rs.status().ToString()};
+    }
+
+    auto buf = rs.value();
+    if (buf == nullptr) {
+        return {common::kCodegenEncodeError, "internal error: encoded buf is null"};
+    }
+
+    *slice = base::RefCountedSlice::CreateManaged(buf, RowView::GetSize(buf));
+
+    return {};
+}
+
+RowBuilder2::RowBuilder2(vm::HybridSeJitWrapper* jit, int sliceSize) : jit_(jit) {
+    schemas_.resize(sliceSize);
+    builders_.resize(sliceSize);
+}
+RowBuilder2::RowBuilder2(vm::HybridSeJitWrapper* jit, const std::vector<codec::Schema>& schemas)
+    : jit_(jit), schemas_(schemas) {
+    builders_.resize(schemas_.size());
+}
+RowBuilder2::RowBuilder2(vm::HybridSeJitWrapper* jit,
+                         const std::vector<std::vector<hybridse::type::ColumnDef>>& schemas)
+    : jit_(jit) {
+    for (auto& sc : schemas) {
+        schemas_.push_back(Schema());
+        auto& ref = schemas_.back();
+        for (auto& col : sc) {
+            ref.Add()->CopyFrom(col);
+        }
+    }
+    builders_.resize(schemas_.size());
+}
+
+base::Status RowBuilder2::Init() {
+    CHECK_TRUE(jit_ != nullptr, common::kCodegenEncodeError, "jit is null");
+    for (size_t i = 0; i < schemas_.size(); ++i) {
+        CHECK_TRUE(!schemas_[i].empty(), common::kCodegenEncodeError, absl::StrCat(i, "th schema un-initialized"));
+        if (builders_[i] == nullptr) {
+            builders_[i] = std::make_shared<SliceBuilder>(jit_, &schemas_[i]);
+        }
+    }
+
+    initialized_ = true;
+    return {};
+}
+
+base::Status RowBuilder2::Build(const std::vector<node::ExprNode*>& values, codec::Row* out) {
+    EnsureInitialized();
+
+    auto expect_cols =
+        std::accumulate(schemas_.begin(), schemas_.end(), 0, [](int val, const auto& e) { return val + e.size(); });
+    CHECK_TRUE(values.size() == expect_cols, common::kCodegenEncodeError, "pass in expr number do not match, expect ",
+               expect_cols, " but got ", values.size(), ": (",
+               absl::StrJoin(
+                   values, ", ",
+                   [](std::string* out, const node::ExprNode* expr) { absl::StrAppend(out, expr->GetExprString()); }),
+               ")");
+
+    int col_idx = 0;
+    Row row;
+    auto values_ref = absl::MakeSpan(values);
+    for (size_t i = 0; i < schemas_.size(); ++i) {
+        RefCountedSlice slice;
+        CHECK_STATUS(builders_[i]->Build(values_ref.subspan(col_idx, schemas_[i].size()), &slice));
+        if (i == 0) {
+            row.Reset(slice);
+        } else {
+            row.Append(slice);
+        }
+
+        col_idx += schemas_[i].size();
+    }
+
+    *out = row;
+
+    return {};
+}
+base::Status RowBuilder2::InitSchema(int idx, const codec::Schema& sc) {
+    if (idx >= schemas_.size()) {
+        return {common::kCodegenEncodeError, "idx out of bound"};
+    }
+    schemas_[idx] = sc;
+    return {};
+}
 }  // namespace codec
 }  // namespace hybridse

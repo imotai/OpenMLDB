@@ -23,9 +23,15 @@ namespace udf {
 
 class DefaultUdfLibrary : public UdfLibrary {
  public:
-    static DefaultUdfLibrary* get() { return &inst_; }
+    static DefaultUdfLibrary* get();
+
+    ~DefaultUdfLibrary() override {}
 
  private:
+    static DefaultUdfLibrary* MakeDefaultUdf();
+
+    DefaultUdfLibrary() { Init(); }
+
     void Init();
     void InitMathUdf();
     void InitStringUdf();
@@ -41,11 +47,22 @@ class DefaultUdfLibrary : public UdfLibrary {
     void InitMinByCateUdafs();
     void initMaxByCateUdaFs();
     void InitAvgByCateUdafs();
+    void InitFeatureSignature();
     void InitFeatureZero();
 
-    static DefaultUdfLibrary inst_;
+    // Array Udf defines, udfs either accept array as parameter or returns array
+    void InitArrayUdfs();
 
-    DefaultUdfLibrary() { Init(); }
+    // Map functions
+    void InitMapUdfs();
+
+    // aggregate functions for statistic
+    void InitStatisticsUdafs();
+
+    // earth distance udfs
+    void InitEarthDistanceUdf();
+
+    void InitJsonUdfs();
 };
 
 }  // namespace udf

@@ -15,12 +15,13 @@
  */
 
 #include "codegen/window_ir_builder.h"
+
 #include <string>
-#include <utility>
-#include <vector>
+
 #include "codec/fe_row_codec.h"
 #include "codegen/ir_base_builder.h"
 #include "glog/logging.h"
+#include "node/node_manager.h"
 
 namespace hybridse {
 namespace codegen {
@@ -108,6 +109,38 @@ bool MemoryWindowDecodeIRBuilder::BuildInnerRangeList(::llvm::Value* list_ptr,
     return true;
 }
 
+bool MemoryWindowDecodeIRBuilder::BuildInnerRowsRangeList(::llvm::Value* list_ptr, ::llvm::Value* row_key,
+                                                          int64_t start_rows, int64_t end_range,
+                                                          ::llvm::Value** output) {
+    if (list_ptr == NULL || output == NULL) {
+        LOG(WARNING) << "input args have null";
+        return false;
+    }
+    if (list_ptr == NULL || output == NULL) {
+        LOG(WARNING) << "input args have null ptr";
+        return false;
+    }
+    ::llvm::IRBuilder<> builder(block_);
+    ::llvm::Type* i8_ty = builder.getInt8Ty();
+    ::llvm::Type* i8_ptr_ty = builder.getInt8PtrTy();
+    ::llvm::Type* i32_ty = builder.getInt32Ty();
+    ::llvm::Type* i64_ty = builder.getInt64Ty();
+    uint32_t inner_list_size = sizeof(::hybridse::codec::InnerRowsRangeList<hybridse::codec::Row>);
+    // alloca memory on stack for col iterator
+    ::llvm::ArrayType* array_type = ::llvm::ArrayType::get(i8_ty, inner_list_size);
+    ::llvm::Value* inner_list_ptr = CreateAllocaAtHead(&builder, array_type, "sub_window_alloca");
+    inner_list_ptr = builder.CreatePointerCast(inner_list_ptr, i8_ptr_ty);
+
+    ::llvm::Value* val_start_offset = builder.getInt64(start_rows);
+    ::llvm::Value* val_end_offset = builder.getInt64(end_range);
+    ::llvm::FunctionCallee callee = block_->getModule()->getOrInsertFunction(
+        "hybridse_storage_get_inner_rows_range_list", i32_ty, i8_ptr_ty, i64_ty, i64_ty, i64_ty, i8_ptr_ty);
+    builder.CreateCall(
+        callee, ::llvm::ArrayRef<::llvm::Value*>{list_ptr, row_key, val_start_offset, val_end_offset, inner_list_ptr});
+    *output = inner_list_ptr;
+    return true;
+}
+
 bool MemoryWindowDecodeIRBuilder::BuildGetCol(size_t schema_idx, size_t col_idx,
                                               ::llvm::Value* window_ptr,
                                               ::llvm::Value** output) {
@@ -115,25 +148,29 @@ bool MemoryWindowDecodeIRBuilder::BuildGetCol(size_t schema_idx, size_t col_idx,
         LOG(WARNING) << "input args have null";
         return false;
     }
-    ::hybridse::node::TypeNode data_type;
-    auto row_format = schemas_context_->GetRowFormat(schema_idx);
+    auto row_format = schemas_context_->GetRowFormat();
     if (row_format == nullptr) {
         LOG(WARNING) << "fail to get row format at " << schema_idx;
         return false;
     }
-    const codec::ColInfo* col_info = row_format->GetColumnInfo(col_idx);
+    const codec::ColInfo* col_info = row_format->GetColumnInfo(schema_idx, col_idx);
     if (col_info == nullptr) {
         LOG(WARNING) << "fail to get column info at " << schema_idx << ":"
                      << col_idx;
         return false;
     }
-    if (!SchemaType2DataType(col_info->type, &data_type)) {
-        LOG(WARNING) << "unrecognized data type " +
-                            hybridse::type::Type_Name(col_info->type);
+
+    auto row_format_corrected_col_idx = col_info->idx;
+
+    node::NodeManager tmp_nm;
+    auto rs = ColumnSchema2Type(col_info->schema, &tmp_nm);
+    if (!rs.ok()) {
+        LOG(WARNING) << rs.status();
         return false;
     }
     ::llvm::IRBuilder<> builder(block_);
-    switch (data_type.base_) {
+    auto* data_type = rs.value();
+    switch (data_type->base_) {
         case ::hybridse::node::kBool:
         case ::hybridse::node::kInt16:
         case ::hybridse::node::kInt32:
@@ -142,29 +179,32 @@ bool MemoryWindowDecodeIRBuilder::BuildGetCol(size_t schema_idx, size_t col_idx,
         case ::hybridse::node::kDouble:
         case ::hybridse::node::kTimestamp:
         case ::hybridse::node::kDate: {
-            return BuildGetPrimaryCol("hybridse_storage_get_col", window_ptr,
-                                      schema_idx, col_idx, col_info->offset,
-                                      &data_type, output);
+            if (!col_info->schema.has_base_type()) {
+                LOG(WARNING) << "input type is not base type: " << col_info->schema.DebugString();
+                return false;
+            }
+            return BuildGetPrimaryCol("hybridse_storage_get_col", window_ptr, schema_idx, row_format_corrected_col_idx,
+                                      col_info->offset, data_type, col_info->schema.base_type(), output);
         }
         case ::hybridse::node::kVarchar: {
-            codec::StringColInfo str_col_info;
-            if (!schemas_context_->GetRowFormat(schema_idx)
-                     ->GetStringColumnInfo(col_idx, &str_col_info)) {
-                LOG(WARNING)
-                    << "fail to get string filed offset and next offset"
-                    << " at " << col_idx;
+            auto s = schemas_context_->GetRowFormat()
+                     ->GetStringColumnInfo(schema_idx, col_idx);
+            if (!s.ok()) {
+                LOG(WARNING) << "fail to get string filed offset and next offset"
+                             << " at " << col_idx << ": " << s.status();
             }
+            auto& str_col_info = s.value();
             DLOG(INFO) << "get string with offset " << str_col_info.offset
                        << " next offset " << str_col_info.str_next_offset
                        << " for col at " << str_col_info.name;
-            return BuildGetStringCol(
-                schema_idx, str_col_info.idx, str_col_info.offset,
-                str_col_info.str_next_offset, str_col_info.str_start_offset,
-                &data_type, window_ptr, output);
+            return BuildGetStringCol(schema_idx, str_col_info.idx, str_col_info.offset, str_col_info.str_next_offset,
+                                     str_col_info.str_start_offset, data_type, window_ptr, output);
+        }
+        case ::hybridse::node::kMap: {
+            // WIP
         }
         default: {
-            LOG(WARNING) << "Fail get col, invalid data type "
-                         << data_type.GetName();
+            LOG(WARNING) << "Fail get col, invalid data type " << data_type->DebugString();
             return false;
         }
     }
@@ -172,7 +212,7 @@ bool MemoryWindowDecodeIRBuilder::BuildGetCol(size_t schema_idx, size_t col_idx,
 
 bool MemoryWindowDecodeIRBuilder::BuildGetPrimaryCol(
     const std::string& fn_name, ::llvm::Value* row_ptr, size_t schema_idx,
-    size_t col_idx, uint32_t offset, hybridse::node::TypeNode* type,
+    size_t col_idx, uint32_t offset, hybridse::node::TypeNode* type, type::Type base_type,
     ::llvm::Value** output) {
     if (row_ptr == NULL || output == NULL) {
         LOG(WARNING) << "input args have null ptr";
@@ -213,15 +253,8 @@ bool MemoryWindowDecodeIRBuilder::BuildGetPrimaryCol(
     ::llvm::Value* val_schema_idx = builder.getInt32(schema_idx);
     ::llvm::Value* val_col_idx = builder.getInt32(col_idx);
     ::llvm::Value* val_offset = builder.getInt32(offset);
-    ::hybridse::type::Type schema_type;
-    if (!DataType2SchemaType(*type, &schema_type)) {
-        LOG(WARNING) << "fail to convert data type to schema type: "
-                     << type->GetName();
-        return false;
-    }
+    ::llvm::Value* val_type_id = builder.getInt32(static_cast<int32_t>(base_type));
 
-    ::llvm::Value* val_type_id =
-        builder.getInt32(static_cast<int32_t>(schema_type));
     ::llvm::FunctionCallee callee = block_->getModule()->getOrInsertFunction(
         fn_name, i32_ty, i8_ptr_ty, i32_ty, i32_ty, i32_ty, i32_ty, i8_ptr_ty);
     builder.CreateCall(callee, {row_ptr, val_schema_idx, val_col_idx,
@@ -281,14 +314,9 @@ bool MemoryWindowDecodeIRBuilder::BuildGetStringCol(
     ::llvm::Value* val_col_idx = builder.getInt32(col_idx);
     ::llvm::Value* str_offset = builder.getInt32(offset);
     ::llvm::Value* next_str_offset = builder.getInt32(next_str_field_offset);
-    ::hybridse::type::Type schema_type;
-    if (!DataType2SchemaType(*type, &schema_type)) {
-        LOG(WARNING) << "fail to convert data type to schema type: "
-                     << type->GetName();
-        return false;
-    }
-    ::llvm::Value* val_type_id =
-        builder.getInt32(static_cast<int32_t>(schema_type));
+
+    ::llvm::Value* val_type_id = builder.getInt32(static_cast<int32_t>(type::kVarchar));
+
     builder.CreateCall(
         callee,
         {window_ptr, val_schema_idx, val_col_idx, str_offset, next_str_offset,

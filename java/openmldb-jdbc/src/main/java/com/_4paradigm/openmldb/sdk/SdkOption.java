@@ -16,50 +16,89 @@
 
 package com._4paradigm.openmldb.sdk;
 
-public class SdkOption {
-    private String zkCluster;
-    private String zkPath;
+import lombok.Data;
+import java.io.Serializable;
+
+import com._4paradigm.openmldb.BasicRouterOptions;
+import com._4paradigm.openmldb.SQLRouterOptions;
+import com._4paradigm.openmldb.StandaloneOptions;
+
+@Data
+public class SdkOption implements Serializable {
+    // TODO(hw): set isClusterMode automatically
+    private boolean isClusterMode = true;
+    // options for cluster mode
+    private String zkCluster = "";
+    private String zkPath = "";
     private long sessionTimeout = 10000;
+    private String sparkConfPath = "";
+    private int zkLogLevel = 3;
+    private String zkLogFile = "";
+    private String zkCert = "";
+
+    // options for standalone mode
+    private String host = "";
+    private long port = -1;
+
+    // base options
     private Boolean enableDebug = false;
     private long requestTimeout = 60000;
+    private int glogLevel = 0;
+    private String glogDir = "";
+    private int maxSqlCacheSize = 50;
+    private boolean isLight = false;
+    private String user = "root";
+    private String password = "";
 
-    public String getZkCluster() {
-        return zkCluster;
+    private void buildBaseOptions(BasicRouterOptions opt) {
+        opt.setEnable_debug(getEnableDebug());
+        opt.setRequest_timeout(getRequestTimeout());
+        opt.setGlog_level(getGlogLevel());
+        opt.setGlog_dir(getGlogDir());
+        opt.setMax_sql_cache_size(getMaxSqlCacheSize());
+        opt.setUser(getUser());
+        if (!getPassword().isEmpty()) {
+            opt.setPassword(getPassword());
+        }
     }
 
-    public void setZkCluster(String zkCluster) {
-        this.zkCluster = zkCluster;
+    public SQLRouterOptions buildSQLRouterOptions() throws SqlException {
+        if (!isClusterMode()) {
+            return null;
+        }
+        SQLRouterOptions copt = new SQLRouterOptions();
+        // required
+        if (getZkCluster().isEmpty() || getZkPath().isEmpty()) {
+            throw new SqlException("empty zk cluster or path");
+        }
+        copt.setZk_cluster(getZkCluster());
+        copt.setZk_path(getZkPath());
+
+        // optional
+        copt.setZk_session_timeout(getSessionTimeout());
+        copt.setSpark_conf_path(getSparkConfPath());
+        copt.setZk_log_level(getZkLogLevel());
+        copt.setZk_log_file(getZkLogFile());
+        copt.setZk_cert(getZkCert());
+
+        // base
+        buildBaseOptions(copt);
+        return copt;
     }
 
-    public String getZkPath() {
-        return zkPath;
-    }
+    public StandaloneOptions buildStandaloneOptions() throws SqlException {
+        if (isClusterMode()) {
+            return null;
+        }
+        StandaloneOptions sopt = new StandaloneOptions();
+        // required
+        if (getHost().isEmpty() || getPort() == -1) {
+            throw new SqlException("empty host or unset port");
+        }
+        sopt.setHost(getHost());
+        sopt.setPort(getPort());
 
-    public void setZkPath(String zkPath) {
-        this.zkPath = zkPath;
-    }
-
-    public long getSessionTimeout() {
-        return sessionTimeout;
-    }
-
-    public void setSessionTimeout(long sessionTimeout) {
-        this.sessionTimeout = sessionTimeout;
-    }
-
-    public Boolean getEnableDebug() {
-        return enableDebug;
-    }
-
-    public void setEnableDebug(Boolean enableDebug) {
-        this.enableDebug = enableDebug;
-    }
-
-    public long getRequestTimeout() {
-        return requestTimeout;
-    }
-
-    public void setRequestTimeout(long requestTimeout) {
-        this.requestTimeout = requestTimeout;
-    }
+        buildBaseOptions(sopt);
+        return sopt;
+    } 
 }

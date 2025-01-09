@@ -21,6 +21,15 @@ cases:
         +-node[CMD]
           +-cmd_type: create database
           +-args: [db1]
+  - id: 1-1
+    desc: create db if not exists
+    sql: create database if not exists db2;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: create database
+          +-if_not_exists: true
+          +-args: [db2]
   - id: 2
     desc: CREATE TABLE
     sql: CREATE TABLE schema.sql;
@@ -30,9 +39,7 @@ cases:
           +-table: schema.sql
           +-IF NOT EXIST: 0
           +-column_desc_list: []
-          +-replica_num: 1
-          +-partition_num: 1
-          +-distribution_list: []
+          +-table_option_list: []
   - id: 3
     desc: CREATE GROUP
     mode: zetasql-unsupport
@@ -132,6 +139,15 @@ cases:
         +-node[CMD]
           +-cmd_type: drop table
           +-args: [db1, t1]
+  - id: 14-3
+    desc: DROP TABLE IF EXISTS
+    sql: DROP TABLE IF EXISTS t1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop table
+          +-if_exists: true
+          +-args: [t1]
   - id: 15-1
     desc: DROP INDEX
     sql: DROP INDEX t1.index1
@@ -164,6 +180,32 @@ cases:
         +-node[CMD]
           +-cmd_type: drop database
           +-args: [db1]
+  - id: 18
+    desc: DROP DATABASE IF EXISTS
+    sql: DROP DATABASE IF EXISTS db1
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop database
+          +-if_exists: true
+          +-args: [db1]
+  - id: drop_user
+    desc: DROP USER IF EXISTS
+    sql: DROP USER IF EXISTS user1
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop user
+          +-if_exists: true
+          +-args: [user1]
+  - id: drop_user_1
+    desc: DROP USER
+    sql: DROP USER user1
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop user
+          +-args: [user1]
   - id: show_deployments
     desc: show deployments
     sql: SHOW DEPLOYMENTS;
@@ -172,7 +214,7 @@ cases:
         +-node[CMD]
           +-cmd_type: show deployments
           +-args: []
-  - id: show_deployment
+  - id: show_deployment1
     desc: show deployment foo
     sql: SHOW DEPLOYMENT foo;
     expect:
@@ -180,7 +222,23 @@ cases:
         +-node[CMD]
           +-cmd_type: show deployment
           +-args: [foo]
-  - id: drop_deployment
+  - id: show_deployment2
+    desc: show deployment foo
+    sql: SHOW DEPLOYMENT db.foo;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show deployment
+          +-args: [db, foo]
+  - id: show_functions
+    desc: show functions
+    sql: SHOW FUNCTIONS;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show functions
+          +-args: []
+  - id: drop_deployment1
     desc: drop deployment foo
     sql: DROP DEPLOYMENT foo;
     expect:
@@ -188,6 +246,14 @@ cases:
         +-node[CMD]
           +-cmd_type: drop deployment
           +-args: [foo]
+  - id: drop_deployment2
+    desc: drop deployment foo
+    sql: DROP DEPLOYMENT db.foo;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop deployment
+          +-args: [db, foo]
   - id: deploy_stmt_1
     desc: deploy query task
     sql: DEPLOY foo SELECT col1 from t1;
@@ -196,6 +262,7 @@ cases:
         +-node[kDeployStmt]
           +-if_not_exists: false
           +-name: foo
+          +-options: <nil>
           +-stmt:
             +-node[kQuery]: kQuerySelect
               +-distinct_opt: false
@@ -226,6 +293,42 @@ cases:
         +-node[kDeployStmt]
           +-if_not_exists: true
           +-name: foo2
+          +-options: <nil>
+          +-stmt:
+            +-node[kQuery]: kQuerySelect
+              +-distinct_opt: false
+              +-where_expr: null
+              +-group_expr_list: null
+              +-having_expr: null
+              +-order_expr_list: null
+              +-limit: null
+              +-select_list[list]:
+              |  +-0:
+              |    +-node[kResTarget]
+              |      +-val:
+              |      |  +-expr[column ref]
+              |      |    +-relation_name: <nil>
+              |      |    +-column_name: col1
+              |      +-name: <nil>
+              +-tableref_list[list]:
+              |  +-0:
+              |    +-node[kTableRef]: kTable
+              |      +-table: t1
+              |      +-alias: <nil>
+              +-window_list: []
+  - id: deploy_stmt_options
+    desc: deploy query task if not exists
+    sql: DEPLOY IF NOT EXISTS foo_op OPTIONS(long_windows="w1:100") SELECT col1 from t1;
+    expect:
+      node_tree_str: |
+        +-node[kDeployStmt]
+          +-if_not_exists: true
+          +-name: foo_op
+          +-options:
+          |  +-long_windows:
+          |    +-expr[primary]
+          |      +-value: w1:100
+          |      +-type: string
           +-stmt:
             +-node[kQuery]: kQuerySelect
               +-distinct_opt: false
@@ -376,6 +479,45 @@ cases:
         +-node[CMD]
           +-cmd_type: show jobs
           +-args: []
+  - id: show jobs from taskmanager
+    sql: SHOW JOBS FROM TASKMANAGER
+    expect:
+      node_tree_str: |
+        +-node[kShowStmt]
+          +-show type: Jobs
+          +-target: TASKMANAGER
+          +-like_str: <nil>
+      plan_tree_str: |
+        +-[kPlanTypeShow]
+          +-show type: Jobs
+          +-target: TASKMANAGER
+          +-like_str: <nil>
+  - id: show jobs from nameserver
+    sql: SHOW JOBS FROM NAMESERVER
+    expect:
+      node_tree_str: |
+        +-node[kShowStmt]
+          +-show type: Jobs
+          +-target: NAMESERVER
+          +-like_str: <nil>
+      plan_tree_str: |
+        +-[kPlanTypeShow]
+          +-show type: Jobs
+          +-target: NAMESERVER
+          +-like_str: <nil>
+  - id: show jobs from nameserver like
+    sql: SHOW JOBS FROM NAMESERVER LIKE '1'
+    expect:
+      node_tree_str: |
+        +-node[kShowStmt]
+          +-show type: Jobs
+          +-target: NAMESERVER
+          +-like_str: 1
+      plan_tree_str: |
+        +-[kPlanTypeShow]
+          +-show type: Jobs
+          +-target: NAMESERVER
+          +-like_str: 1
   - id: show job
     sql: SHOW JOB 1
     expect:
@@ -383,6 +525,13 @@ cases:
         +-node[CMD]
           +-cmd_type: show job
           +-args: [1]
+  - id: show joblog
+    sql: SHOW JOBLOG 79
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show joblog
+          +-args: [79]
   - id: stop_job_1
     sql: stop JOB 10;
     expect:
@@ -441,6 +590,30 @@ cases:
             +-expr[primary]
               +-value: yyyy
               +-type: string
+  - id: set global to int
+    sql: SET GLOBAL var1 = 100;
+    expect:
+      node_tree_str: |
+        +-node[kSetStmt]
+          +-scope: GlobalSystemVariable
+          +-key: var1
+          +-value:
+            +-expr[primary]
+              +-value: 100
+              +-type: int32
+
+  - id: set session to string
+    sql: SET SESSION var2 = '100';
+    expect:
+      node_tree_str: |
+        +-node[kSetStmt]
+          +-scope: SessionSystemVariable
+          +-key: var2
+          +-value:
+            +-expr[primary]
+              +-value: 100
+              +-type: string
+
   - id: show_variables
     sql: SHOW VARIABLES;
     expect:
@@ -462,3 +635,130 @@ cases:
         +-node[CMD]
           +-cmd_type: show global variables
           +-args: []
+  - id: show_components
+    sql: SHOW COMPONENTS;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show components
+          +-args: []
+  - id: show_table_status
+    sql: SHOW table status;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show table status
+          +-args: []
+  - id: drop_function_stmt
+    desc: drop_function
+    sql: DROP FUNCTION func1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop function
+          +-args: [func1]
+  - id: drop_function_if_exists_stmt
+    desc: drop_function
+    sql: DROP FUNCTION IF EXISTS func1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: drop function
+          +-if_exists: true
+          +-args: [func1]
+  - id: truncate_stmt
+    desc: truncate
+    sql: TRUNCATE TABLE t1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: truncate table
+          +-args: [t1]
+  - id: truncate_stmt_db
+    desc: truncate
+    sql: TRUNCATE TABLE db1.t1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: truncate table
+          +-args: [db1, t1]
+  - id: exit_stmt
+    desc: exit statement
+    sql: EXIT;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: exit
+          +-args: []
+
+  - id: alter-table-add-path
+    sql: |
+      alter table t1 add offline_path '12'
+    expect:
+      node_tree_str: |
+        +-node[kAlterTableStmt]
+          +-path: .t1
+          +-actions:
+            +-0: AddPathAction (12)
+      plan_tree_str: |
+        +-[kPlanTypeAlterTable]
+          +-path: .t1
+          +-actions:
+            +-0: AddPathAction (12)
+
+  - id: alter-table-drop-path
+    sql: |
+      alter table db.t1 drop offline_path '12'
+    expect:
+      node_tree_str: |
+        +-node[kAlterTableStmt]
+          +-path: db.t1
+          +-actions:
+            +-0: DropPathAction (12)
+      plan_tree_str: |
+        +-[kPlanTypeAlterTable]
+          +-path: db.t1
+          +-actions:
+            +-0: DropPathAction (12)
+
+  - id: alter-table-drop-path-2
+    sql: |
+      alter table db.t1 drop offline_path '12', add offline_path '13'
+    expect:
+      node_tree_str: |
+        +-node[kAlterTableStmt]
+          +-path: db.t1
+          +-actions:
+            +-0: DropPathAction (12)
+            +-1: AddPathAction (13)
+      plan_tree_str: |
+        +-[kPlanTypeAlterTable]
+          +-path: db.t1
+          +-actions:
+            +-0: DropPathAction (12)
+            +-1: AddPathAction (13)
+
+  - id: show-create-table
+    desc: SHOW CREATE TABLE
+    sql: SHOW CREATE TABLE t1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show create table
+          +-args: [t1]
+  - id: show-create-table-db
+    desc: SHOW CREATE TABLE
+    sql: SHOW CREATE TABLE db1.t1;
+    expect:
+      node_tree_str: |
+        +-node[CMD]
+          +-cmd_type: show create table
+          +-args: [db1, t1]
+
+  - id: callstmt
+    sql: call sp(1, cast("ab" as string))
+    expect:
+      plan_tree_str: |
+        +-[kPlanTypeCallStmt]
+          +-procedure_name: [sp]
+          +-arguments: 1, STRING(ab)

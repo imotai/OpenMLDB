@@ -17,21 +17,25 @@
 package com._4paradigm.openmldb.batchjob
 
 import com._4paradigm.openmldb.batch.api.OpenmldbSession
+import com._4paradigm.openmldb.batchjob.util.OpenmldbJobUtil
+import org.apache.spark.SparkFiles
 import org.apache.spark.sql.SparkSession
 
 object RunBatchSql {
 
   def main(args: Array[String]): Unit = {
-    if (args.length < 2) {
-      throw new Exception(s"Require args: sql, outputPath but get args: ${args.mkString(",")}")
-    }
-
-    runBatchSql(args(0), args(1))
+    OpenmldbJobUtil.checkArgumentSize(args, 1)
+    runBatchSql(args(0))
   }
 
-  def runBatchSql(sql: String, outputPath: String): Unit = {
-    val sess = new OpenmldbSession(SparkSession.builder().getOrCreate())
-    sess.sql(sql).getSparkDf.write.parquet(outputPath)
+  def runBatchSql(sqlFilePath: String): Unit = {
+    val spark = SparkSession.builder().getOrCreate()
+    val sqlText = OpenmldbJobUtil.getSqlFromFile(spark, sqlFilePath)
+
+    val sess = new OpenmldbSession(spark)
+    // offline sync and send result back to taskmanager
+    // no show to print, save result by http in all modes?
+    sess.sql(sqlText).sendResult()
     sess.close()
   }
 

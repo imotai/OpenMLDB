@@ -16,21 +16,32 @@
 
 package com._4paradigm.openmldb.batch.catalog
 
-import com._4paradigm.openmldb.proto.NS
+import com._4paradigm.openmldb.common.zk.{ZKClient, ZKConfig}
+import com._4paradigm.openmldb.proto.{Common, NS}
 import com._4paradigm.openmldb.sdk.impl.SqlClusterExecutor
 import com._4paradigm.openmldb.sdk.SdkOption
+
 import scala.collection.JavaConverters.asScalaBufferConverter
 import scala.collection.mutable
 
-class OpenmldbCatalogService(val zkCluster: String, val zkPath: String, val openmldbJsdkPath: String) {
+class OpenmldbCatalogService(val zkCluster: String, val zkPath: String, val username: String, val password: String,
+                             val openmldbJsdkPath: String) {
 
   val option = new SdkOption
   option.setZkCluster(zkCluster)
   option.setZkPath(zkPath)
-  val sqlExecutor = new SqlClusterExecutor(option, openmldbJsdkPath)
+  option.setUser(username)
+  option.setPassword(password)
 
-  def this(zkCluster: String, zkPath: String) = {
-    this(zkCluster, zkPath, "")
+  val sqlExecutor = new SqlClusterExecutor(option, openmldbJsdkPath)
+  val zkClient = new ZKClient(ZKConfig.builder()
+    .cluster(zkCluster)
+    .namespace(zkPath)
+    .build())
+  zkClient.connect();
+
+  def this(zkCluster: String, zkPath: String, username: String, password: String) = {
+    this(zkCluster, zkPath, username, password, "")
   }
 
   def getDatabases: Array[String] = {
@@ -60,6 +71,23 @@ class OpenmldbCatalogService(val zkCluster: String, val zkPath: String, val open
 
   def updateOfflineTableInfo(info: NS.TableInfo): Boolean = {
     sqlExecutor.updateOfflineTableInfo(info)
+  }
+
+  def getExternalFunctionsMap(): Map[String, com._4paradigm.openmldb.proto.Common.ExternalFun] = {
+    val funPath = zkPath + "/data/function"
+
+    val externalFunMap = mutable.Map[String, com._4paradigm.openmldb.proto.Common.ExternalFun]()
+
+    if (zkClient.checkExists(funPath)) {
+      val funNames = zkClient.getChildren(funPath)
+      for (name <- funNames.asScala) {
+        val value = zkClient.getNodeValue(funPath + "/" + name);
+        val funProto = com._4paradigm.openmldb.proto.Common.ExternalFun.parseFrom(value.getBytes());
+        externalFunMap.put(name, funProto)
+      }
+    }
+
+    externalFunMap.toMap
   }
 
 }

@@ -22,6 +22,9 @@ import org.apache.spark.sql.SparkSession
 
 class OpenmldbBatchConfig extends Serializable {
 
+  @ConfigOption(name = "openmldb.print.version", doc = "Print the OpenMLDB version or not")
+  var printVersion: Boolean = true
+
   // The integration like WindowAgg and GroupBy will use this config to set partition number
   @ConfigOption(name = "openmldb.groupby.partitions", doc = "Default partition number used in group by")
   var groupbyPartitions: Int = -1
@@ -29,7 +32,7 @@ class OpenmldbBatchConfig extends Serializable {
   @ConfigOption(name = "spark.sql.session.timeZone")
   var timeZone = "Asia/Shanghai"
 
-  // test mode 用于测试的时候验证相关问题
+  // test mode
   @ConfigOption(name = "openmldb.test.tiny", doc = "控制读取表的数据条数，默认读全量数据")
   var tinyData: Long = -1
 
@@ -41,6 +44,10 @@ class OpenmldbBatchConfig extends Serializable {
 
   @ConfigOption(name = "openmldb.test.print", doc = "执行过程中允许打印数据")
   var print: Boolean = false
+
+  // Debug options
+  @ConfigOption(name = "openmldb.debug.show_node_df", doc = "Use Spark DataFrame.show() for each physical nodes")
+  var debugShowNodeDf: Boolean = false
 
   // Window skew optimization
   @ConfigOption(name = "openmldb.window.skew.opt", doc = "Enable window skew optimization or not")
@@ -66,7 +73,6 @@ class OpenmldbBatchConfig extends Serializable {
   @ConfigOption(name = "openmldb.window.skew.opt.config", doc = "The skew config for window skew optimization")
   var windowSkewOptConfig: String = ""
 
-  // 慢速执行模式
   @ConfigOption(name = "openmldb.slowRunCacheDir", doc =
     """
       | Slow run mode cache directory path. If specified, run OpenMLDB plan with slow mode.
@@ -109,19 +115,35 @@ class OpenmldbBatchConfig extends Serializable {
   @ConfigOption(name = "openmldb.physical.plan.graphviz.path", doc = "The path of physical plan graphviz image")
   var physicalPlanGraphvizPath = ""
 
-  @ConfigOption(name = "openmldb.physical.plan.print", doc = "Print the sql physical plan")
+  @ConfigOption(name = "openmldb.debug.print_physical_plan", doc = "Print the sql physical plan")
   var printPhysicalPlan = false
 
   @ConfigOption(name = "openmldb.enable.native.last.join", doc = "Enable native last join or not")
-  var enableNativeLastJoin = true
+  var enableNativeLastJoin = false
 
   // UnsafeRow optimization
-  @ConfigOption(name = "openmldb.unsaferow.opt", doc = "Enable UnsafeRow optimization or not")
+  @ConfigOption(name = "openmldb.unsaferowopt.enable", doc = "Enable UnsafeRow optimization or not")
   var enableUnsafeRowOptimization = false
 
-  // Switch for disable OpenMLDB
-  @ConfigOption(name = "openmldb.disable", doc = "Disable OpenMLDB optimization or not")
-  var disableOpenmldb = false
+  @ConfigOption(name = "openmldb.unsaferowopt.project", doc = "Enable UnsafeRow optimization for project")
+  var enableUnsafeRowOptForProject = true
+
+  @ConfigOption(name = "openmldb.unsaferowopt.window", doc = "Enable UnsafeRow optimization for window")
+  var enableUnsafeRowOptForWindow = true
+
+  //@ConfigOption(name = "openmldb.opt.unsaferow.groupby", doc = "Enable UnsafeRow optimization for groupby")
+  //var enableUnsafeRowOptForGroupby = false
+
+  @ConfigOption(name = "openmldb.unsaferowopt.copydirectbytebuffer", doc = "Copy row with DirectByteBuffer")
+  var unsaferowoptCopyDirectByteBuffer = false
+
+  // Join optimization
+  @ConfigOption(name = "openmldb.opt.join.spark_expr", doc = "Enable join with original Spark expression")
+  var enableJoinWithSparkExpr = true
+
+  // Use SparkSQL
+  @ConfigOption(name = "openmldb.sparksql", doc = "Enable SparkSQL instead of using OpenMLDB execution engine")
+  var enableSparksql = false
 
   // OpenMLDB Java SDK dynamic library path, notice that this should not be set hybridse jsdk so
   @ConfigOption(name = "openmldb.jsdk.library.path", doc = "The path of OpenMLDB Java SDK core file path")
@@ -133,6 +155,12 @@ class OpenmldbBatchConfig extends Serializable {
   @ConfigOption(name = "openmldb.zk.root.path", doc = "The root path of ZooKeeper for NameServer")
   var openmldbZkRootPath = ""
 
+  @ConfigOption(name = "openmldb.user", doc = "The user of OpenMLDB")
+  var openmldbUser = "root"
+
+  @ConfigOption(name = "openmldb.password", doc = "The password of OpenMLDB")
+  var openmldbPassword = ""
+
   @ConfigOption(name = "openmldb.default.db", doc = "The default database for OpenMLDB SQL")
   var defaultDb = "default_db"
 
@@ -141,8 +169,28 @@ class OpenmldbBatchConfig extends Serializable {
 
   @ConfigOption(name = "openmldb.offline.data.prefix", doc = "The prefix of offline data")
   var offlineDataPrefix = "file:///tmp/openmldb_offline/"
-}
 
+  @ConfigOption(name = "openmldb.taskmanager.external.function.dir", doc = "The absolute path of TaskManager external" +
+    " function dir")
+  var taskmanagerExternalFunctionDir = "/tmp/udf/"
+
+  @ConfigOption(name = "openmldb.savejobresult.http", doc = "The http url of JobResultSaver(taskmanager), " +
+    "send df to it")
+  var saveJobResultHttp = ""
+
+  @ConfigOption(name = "openmldb.savejobresult.resultid", doc = "The savejobresult id")
+  var saveJobResultId = ""
+
+  // If a post req is too large, > brpc max_body_size, it'll be reject, default is 64M.
+  @ConfigOption(name = "openmldb.savejobresult.rowperpost", doc = "The max row count of a http post request to " +
+    "savejobresult, default is 16000, if the row count is larger than this, will split it into multiple http request" +
+    " with same resultid and different row")
+  var saveJobResultRowPerPost = 16000
+
+  @ConfigOption(name = "openmldb.savejobresult.posttimeouts", doc = "ConnectionRequestTimeout,ConnectTimeout," +
+    "SocketTimeout for http post request to savejobresult, default is '10000,10000,10000', unit is ms")
+  var saveJobResultPostTimeouts = "10000,10000,10000"
+}
 
 object OpenmldbBatchConfig {
 

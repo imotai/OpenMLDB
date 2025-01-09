@@ -14,18 +14,15 @@
  * limitations under the License.
  */
 
-#include <gflags/gflags.h>
 #include <sched.h>
 #include <unistd.h>
+#include <string>
 
-#include <boost/bind.hpp>
-
-#include "base/glog_wapper.h"
-#include "base/kv_iterator.h"
-#include "common/timer.h"
+#include "boost/bind.hpp"
+#include "gflags/gflags.h"
 #include "gtest/gtest.h"
-#include "proto/tablet.pb.h"
 #include "tablet/tablet_impl.h"
+#include "test/util.h"
 
 DECLARE_string(endpoint);
 DECLARE_string(db_root_path);
@@ -42,8 +39,6 @@ namespace tablet {
 uint32_t counter = 10;
 static bool call_invoked = false;
 static size_t endpoint_size = 1;
-
-inline std::string GenRand() { return std::to_string(rand() % 10000000 + 1); }  // NOLINT
 
 void WatchCallback(const std::vector<std::string>& endpoints) {
     if (call_invoked) {
@@ -71,7 +66,7 @@ TEST_F(TabletImplTest, KeepAlive) {
     FLAGS_endpoint = "127.0.0.1:9527";
     FLAGS_zk_cluster = "127.0.0.1:6181";
     FLAGS_zk_root_path = "/rtidb2";
-    ZkClient zk_client(FLAGS_zk_cluster, "", 1000, "test1", FLAGS_zk_root_path);
+    ZkClient zk_client(FLAGS_zk_cluster, "", 1000, "test1", FLAGS_zk_root_path, "", "");
     bool ok = zk_client.Init();
     ASSERT_TRUE(ok);
     ok = zk_client.Mkdir("/rtidb2/nodes");
@@ -96,6 +91,6 @@ int main(int argc, char** argv) {
     srand(time(NULL));
     ::openmldb::base::SetLogLevel(DEBUG);
     ::google::ParseCommandLineFlags(&argc, &argv, true);
-    FLAGS_db_root_path = "/tmp/" + ::openmldb::tablet::GenRand();
+    ::openmldb::test::InitRandomDiskFlags("tablet_impl_keep_alive_test");
     return RUN_ALL_TESTS();
 }

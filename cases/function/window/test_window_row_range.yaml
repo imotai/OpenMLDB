@@ -14,6 +14,7 @@
 
 db: test_zw
 debugs: []
+version: 0.5.0
 cases:
   - id: 0
     desc: string为partition by
@@ -681,6 +682,7 @@ cases:
         - [ "aa", 9, 1590739002000, 3.0 ]
   - id: 24-1
     desc: ROWS_RANGE Pure History Window
+    version: 0.6.0
     inputs:
       - columns: [ "c1 string","c3 int","c4 double","c7 timestamp" ]
         indexs: [ "index1:c1:c7" ]
@@ -703,17 +705,18 @@ cases:
       order: c3
       columns: [ "c1 string", "c3 int", "c7 timestamp",  "w1_c4_sum double" ]
       rows:
-        - [ "aa", 1, 1590738990000, 0.0 ]
+        - [ "aa", 1, 1590738990000, NULL ]
         - [ "aa", 2, 1590738991000, 1.0 ]
         - [ "aa", 3, 1590738992000, 2.0 ]
         - [ "aa", 4, 1590738993000, 3.0 ]
         - [ "aa", 5, 1590738994000, 3.0 ]
         - [ "aa", 6, 1590738995000, 3.0 ]
-        - [ "aa", 7, 1590738999000, 0.0 ]
+        - [ "aa", 7, 1590738999000, NULL ]
         - [ "aa", 8, 1590739001000, 1.0 ]
         - [ "aa", 9, 1590739002000, 2.0 ]
   - id: 24-2
     desc: ROWS_RANGE Pure History Window With MaxSize
+    version: 0.6.0
     inputs:
       - columns: [ "c1 string","c3 int","c4 double","c7 timestamp" ]
         indexs: [ "index1:c1:c7" ]
@@ -729,13 +732,13 @@ cases:
           - [ "aa",9, 1.0, 1590739002000 ]
     request_plan: |
       PROJECT(type=Aggregation)
-        REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -3000, -1000, maxsize=2), index_keys=(auto_t0.c1))
+        REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 3000 PRECEDING, 1000 PRECEDING, maxsize=2), index_keys=(auto_t0.c1))
           DATA_PROVIDER(request=auto_t0)
           DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
 
     batch_plan: |
       PROJECT(type=WindowAggregation)
-        +-WINDOW(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -3000, -1000, maxsize=2))
+        +-WINDOW(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 3000 PRECEDING, 1000 PRECEDING, maxsize=2))
         DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
     sql: |
       SELECT c1, c3, c7,
@@ -746,13 +749,13 @@ cases:
       order: c3
       columns: [ "c1 string", "c3 int", "c7 timestamp",  "w1_c4_sum double" ]
       rows:
-        - [ "aa", 1, 1590738990000, 0.0 ]
+        - [ "aa", 1, 1590738990000, NULL ]
         - [ "aa", 2, 1590738991000, 1.0 ]
         - [ "aa", 3, 1590738992000, 2.0 ]
         - [ "aa", 4, 1590738993000, 2.0 ]
         - [ "aa", 5, 1590738994000, 2.0 ]
         - [ "aa", 6, 1590738995000, 2.0 ]
-        - [ "aa", 7, 1590738999000, 0.0 ]
+        - [ "aa", 7, 1590738999000, NULL ]
         - [ "aa", 8, 1590739001000, 1.0 ]
         - [ "aa", 9, 1590739002000, 2.0 ]
   - id: 25
@@ -779,12 +782,12 @@ cases:
       w2 AS (PARTITION BY {0}.c1 ORDER BY {0}.c7 ROWS_RANGE BETWEEN 2s PRECEDING AND CURRENT ROW MAXSIZE 4);
     request_plan: |
       PROJECT(type=Aggregation)
-        REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -3000, 0, maxsize=4), index_keys=(auto_t0.c1))
+        REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 3000 PRECEDING, 0 CURRENT, maxsize=4), index_keys=(auto_t0.c1))
           DATA_PROVIDER(request=auto_t0)
           DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
     batch_plan: |
       PROJECT(type=WindowAggregation)
-        +-WINDOW(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -3000, 0, maxsize=4))
+        +-WINDOW(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 3000 PRECEDING, 0 CURRENT, maxsize=4))
         DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
     expect:
       order: c3
@@ -825,11 +828,11 @@ cases:
       SIMPLE_PROJECT(sources=(c1, c3, c7, w1_c4_sum, w2_c4_sum))
         REQUEST_JOIN(type=kJoinTypeConcat)
           PROJECT(type=Aggregation)
-            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -3000, 0), index_keys=(auto_t0.c1))
+            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 3000 PRECEDING, 0 CURRENT), index_keys=(auto_t0.c1))
               DATA_PROVIDER(request=auto_t0)
               DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
           PROJECT(type=Aggregation)
-            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -3000, 0, maxsize=2), index_keys=(auto_t0.c1))
+            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 3000 PRECEDING, 0 CURRENT, maxsize=2), index_keys=(auto_t0.c1))
               DATA_PROVIDER(request=auto_t0)
               DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
 
@@ -871,12 +874,12 @@ cases:
       w2 AS (PARTITION BY {0}.c1 ORDER BY {0}.c7 ROWS_RANGE BETWEEN 6s PRECEDING AND CURRENT ROW MAXSIZE 5);
     request_plan: |
       PROJECT(type=Aggregation)
-        REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -6000, 0, maxsize=5), rows=(auto_t0.c7, -3, 0), index_keys=(auto_t0.c1))
+        REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 6000 PRECEDING, 0 CURRENT, maxsize=5), rows=(auto_t0.c7, 3 PRECEDING, 0 CURRENT), index_keys=(auto_t0.c1))
           DATA_PROVIDER(request=auto_t0)
           DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
     batch_plan: |
       PROJECT(type=WindowAggregation)
-        +-WINDOW(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -6000, 0, maxsize=5), rows=(auto_t0.c7, -3, 0))
+        +-WINDOW(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 6000 PRECEDING, 0 CURRENT, maxsize=5), rows=(auto_t0.c7, 3 PRECEDING, 0 CURRENT))
         DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
     expect:
       order: c3
@@ -917,11 +920,11 @@ cases:
       SIMPLE_PROJECT(sources=(c1, c3, c7, w1_c4_sum, w2_c4_sum))
         REQUEST_JOIN(type=kJoinTypeConcat)
           PROJECT(type=Aggregation)
-            REQUEST_UNION(partition_keys=(), orders=(ASC), rows=(auto_t0.c7, -7, 0), index_keys=(auto_t0.c1))
+            REQUEST_UNION(partition_keys=(), orders=(ASC), rows=(auto_t0.c7, 7 PRECEDING, 0 CURRENT), index_keys=(auto_t0.c1))
               DATA_PROVIDER(request=auto_t0)
               DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
           PROJECT(type=Aggregation)
-            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -6000, 0, maxsize=5), index_keys=(auto_t0.c1))
+            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 6000 PRECEDING, 0 CURRENT, maxsize=5), index_keys=(auto_t0.c1))
               DATA_PROVIDER(request=auto_t0)
               DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
     expect:
@@ -940,6 +943,7 @@ cases:
 
   - id: 27-3
     desc: ROWS and ROWS_RANGE Pure History Window Cant' Be Merge
+    version: 0.6.0
     inputs:
       - columns: [ "c1 string","c3 int","c4 double","c7 timestamp" ]
         indexs: [ "index1:c1:c7" ]
@@ -964,11 +968,11 @@ cases:
       SIMPLE_PROJECT(sources=(c1, c3, c7, w1_c4_sum, w2_c4_sum))
         REQUEST_JOIN(type=kJoinTypeConcat)
           PROJECT(type=Aggregation)
-            REQUEST_UNION(partition_keys=(), orders=(ASC), rows=(auto_t0.c7, -3, 0), index_keys=(auto_t0.c1))
+            REQUEST_UNION(partition_keys=(), orders=(ASC), rows=(auto_t0.c7, 3 PRECEDING, 0 CURRENT), index_keys=(auto_t0.c1))
               DATA_PROVIDER(request=auto_t0)
               DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
           PROJECT(type=Aggregation)
-            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, -6000, -2000), index_keys=(auto_t0.c1))
+            REQUEST_UNION(partition_keys=(), orders=(ASC), range=(auto_t0.c7, 6000 PRECEDING, 2000 PRECEDING), index_keys=(auto_t0.c1))
               DATA_PROVIDER(request=auto_t0)
               DATA_PROVIDER(type=Partition, table=auto_t0, index=index1)
 
@@ -976,8 +980,8 @@ cases:
       order: c3
       columns: [ "c1 string", "c3 int", "c7 timestamp",  "w1_c4_sum double", "w2_c4_sum double" ]
       rows:
-        - [ "aa", 1, 1590738990000, 1.0, 0.0 ]
-        - [ "aa", 2, 1590738991000, 2.0, 0.0 ]
+        - [ "aa", 1, 1590738990000, 1.0, NULL ]
+        - [ "aa", 2, 1590738991000, 2.0, NULL ]
         - [ "aa", 3, 1590738992000, 3.0, 1.0 ]
         - [ "aa", 4, 1590738993000, 4.0, 2.0 ]
         - [ "aa", 5, 1590738994000, 4.0, 3.0 ]
@@ -1371,6 +1375,7 @@ cases:
   -
     id: 46
     desc: timestamp为order by-2s-1s
+    version: 0.6.0
     inputs:
       -
         columns : ["c1 string","c3 int","c4 bigint","c5 float","c6 double","c7 timestamp","c8 date"]
@@ -1387,11 +1392,11 @@ cases:
       order: c3
       columns: ["c1 string","c3 int","w1_c4_sum bigint"]
       rows:
-        - ["aa",20,0]
+        - ["aa",20,NULL]
         - ["aa",21,30]
         - ["aa",22,61]
         - ["aa",23,63]
-        - ["bb",24,0]
+        - ["bb",24,NULL]
   -
     id: 47
     desc: timestamp为order by-2s-0s
@@ -1443,6 +1448,7 @@ cases:
   -
     id: 49
     desc: timestamp为order by-2s-1
+    version: 0.6.0
     inputs:
       -
         columns : ["c1 string","c3 int","c4 bigint","c5 float","c6 double","c7 timestamp","c8 date"]
@@ -1459,14 +1465,15 @@ cases:
       order: c3
       columns: ["c1 string","c3 int","w1_c4_sum bigint"]
       rows:
-        - ["aa",20,0]
+        - ["aa",20, NULL]
         - ["aa",21,30]
         - ["aa",22,61]
         - ["aa",23,93]
-        - ["bb",24,0]
+        - ["bb",24, NULL]
   -
     id: 50
     desc: timestamp为order by-前后单位不一样
+    version: 0.6.0
     inputs:
       -
         columns : ["c1 string","c3 int","c4 bigint","c5 float","c6 double","c7 timestamp","c8 date"]
@@ -1483,8 +1490,8 @@ cases:
       order: c3
       columns: ["c1 string","c3 int","w1_c4_sum bigint"]
       rows:
-        - ["aa",20,0]
+        - ["aa",20,NULL]
         - ["aa",21,30]
         - ["aa",22,61]
         - ["aa",23,93]
-        - ["bb",24,0]
+        - ["bb",24,NULL]

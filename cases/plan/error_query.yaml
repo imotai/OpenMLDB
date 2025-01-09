@@ -50,3 +50,31 @@ cases:
       SELECT
       sum(col2) OVER (PARTITION BY col1 ORDER BY col5 ROWS BETWEEN 10 PRECEDING AND CURRENT ROW MAXSIZE 20) as w1_col2_sum
       FROM t1;
+  - id: 6
+    desc: should perform whitespace check after interval literal
+    sql: select 100ss;
+    expect:
+      success: false
+  - id: 7
+    desc: window lower bound frame must less or equal to end bound
+    sql: |
+      select x, sum(y) over (partition by z order by x rows between 0 preceding and 2 preceding) from t1;
+    expect:
+      success: false
+      msg: The lower bound of a window frame must be less than or equal to the upper bound
+  - id: 8
+    desc: window lower bound frame must less or equal to end bound
+    sql: |
+      select x, sum(y) over (partition by z order by x ROWS_RANGE between 2 following and 0 following) from t1;
+    expect:
+      success: false
+      msg: The lower bound of a window frame must be less than or equal to the upper bound
+  - id: 9
+    desc: |
+      show JOB/DEPLOYMENT/JOBLOG requires target name
+    sql: |
+      SHOW JOB
+    expect:
+      success: false
+      msg: |
+        SHOW JOB statement require a target name following

@@ -19,7 +19,8 @@
 #include <gflags/gflags.h>
 #include <stdio.h>
 
-#include "boost/algorithm/string.hpp"
+#include "absl/strings/ascii.h"
+#include "absl/strings/str_replace.h"
 #include "codec/fe_row_codec.h"
 #include "sdk/base.h"
 #include "sdk/sql_router.h"
@@ -27,11 +28,8 @@
 #include "test/base_test.h"
 #include "vm/catalog.h"
 
-DECLARE_bool(enable_distsql);
-DECLARE_bool(enable_localtablet);
 
-typedef ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnDesc> RtiDBSchema;
-typedef ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnKey> RtiDBIndex;
+typedef ::google::protobuf::RepeatedPtrField<::openmldb::common::ColumnDesc> PBSchema;
 // batch request rows size == 1
 void BM_RequestQuery(benchmark::State& state, hybridse::sqlcase::SqlCase& sql_case,  // NOLINT
                      ::openmldb::sdk::MiniCluster* mc) {                             // NOLINT
@@ -61,9 +59,9 @@ void BM_RequestQuery(benchmark::State& state, hybridse::sqlcase::SqlCase& sql_ca
         std::string sql = sql_case.sql_str();
         for (size_t i = 0; i < sql_case.inputs().size(); i++) {
             std::string placeholder = "{" + std::to_string(i) + "}";
-            boost::replace_all(sql, placeholder, sql_case.inputs()[i].name_);
+            absl::StrReplaceAll({{placeholder, sql_case.inputs()[i].name_}}, &sql);
         }
-        boost::to_lower(sql);
+        absl::AsciiStrToLower(&sql);
         LOG(INFO) << sql;
         auto request_row = router->GetRequestRow(sql_case.db(), sql, &status);
         if (status.code != 0) {
@@ -79,7 +77,7 @@ void BM_RequestQuery(benchmark::State& state, hybridse::sqlcase::SqlCase& sql_ca
         }
 
         std::vector<hybridse::codec::Row> request_rows;
-        if (!sql_case.ExtractInputData(sql_case.batch_request_, request_rows)) {
+        if (!sql_case.ExtractInputData(sql_case.batch_request_, request_rows, request_table.columns())) {
             state.SkipWithError("benchmark error: hybridse case input data invalid");
             return;
         }
@@ -227,9 +225,9 @@ void BM_BatchRequestQuery(benchmark::State& state, hybridse::sqlcase::SqlCase& s
         std::string sql = sql_case.sql_str();
         for (size_t i = 0; i < sql_case.inputs().size(); i++) {
             std::string placeholder = "{" + std::to_string(i) + "}";
-            boost::replace_all(sql, placeholder, sql_case.inputs()[i].name_);
+            absl::StrReplaceAll({{placeholder, sql_case.inputs()[i].name_}}, &sql);
         }
-        boost::to_lower(sql);
+        absl::AsciiStrToLower(&sql);
         LOG(INFO) << sql;
         auto request_row = router->GetRequestRow(sql_case.db(), sql, &status);
         if (status.code != 0) {
@@ -245,7 +243,7 @@ void BM_BatchRequestQuery(benchmark::State& state, hybridse::sqlcase::SqlCase& s
         }
 
         std::vector<hybridse::codec::Row> request_rows;
-        if (!sql_case.ExtractInputData(sql_case.batch_request_, request_rows)) {
+        if (!sql_case.ExtractInputData(sql_case.batch_request_, request_rows, request_table.columns())) {
             state.SkipWithError("benchmark error: hybridse case input data invalid");
             return;
         }

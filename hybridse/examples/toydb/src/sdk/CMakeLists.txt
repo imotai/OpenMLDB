@@ -15,10 +15,13 @@
 include_directories(${INCLUDE_DIRECTORIES}
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_BINARY_DIR}/src
-		${PROJECT_SOURCE_DIR}/examples/toydb/src)
+        ${PROJECT_SOURCE_DIR}/examples/toydb/src)
 
-set(SDK_DEPS_LIBS hybridse_core hybridse_flags hybridse_sdk
-	${yaml_libs} boost_filesystem ${VM_LIBS} ${LLVM_LIBS} ${BRPC_LIBS} ${OS_LIB})
+set(SDK_DEPS_LIBS
+    hybridse_sdk
+    ${yaml_libs} ${Boost_filesystem_LIBRARY} ${LLVM_LIBS}
+    ${COMMON_LIBS} ${OS_LIB}
+)
 
 # split sdk test and bm
 set(SDK_SRC_FILE_LIST)
@@ -50,8 +53,11 @@ if (TESTING_ENABLE AND EXAMPLES_TESTING_ENABLE)
 
         add_test(${TEST_TARGET_NAME}
             ${CMAKE_CURRENT_BINARY_DIR}/${TEST_TARGET_DIR}/${TEST_TARGET_NAME}
-            --gtest_output=xml:${CMAKE_BINARY_DIR}/${TEST_TARGET_NAME}.xml)
-        target_link_libraries(${TEST_TARGET_NAME} gtest toydb_sdk toydb_flags toydb_lib zetasql)
+            --gtest_output=xml:${CMAKE_CURRENT_BINARY_DIR}/${TEST_TARGET_DIR}/${TEST_TARGET_NAME}.xml)
+        target_link_libraries(${TEST_TARGET_NAME} ${GTEST_LIBRARIES} toydb_sdk toydb_lib zetasql)
+        if (TESTING_ENABLE_STRIP)
+            strip_exe(${TEST_TARGET_NAME})
+        endif()
         list(APPEND test_list ${TEST_TARGET_NAME})
     endforeach()
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

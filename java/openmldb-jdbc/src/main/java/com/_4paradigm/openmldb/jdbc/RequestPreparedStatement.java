@@ -17,12 +17,15 @@
 package com._4paradigm.openmldb.jdbc;
 
 import com._4paradigm.openmldb.*;
+import com._4paradigm.openmldb.sdk.Common;
+import com._4paradigm.openmldb.sdk.impl.NativeResultSet;
 
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.sql.Date;
 import java.sql.ResultSet;
 import java.sql.*;
@@ -32,7 +35,7 @@ import java.util.List;
 import java.util.Map;
 
 public class RequestPreparedStatement implements java.sql.PreparedStatement {
-    public static final Charset CHARSET = Charset.forName("utf-8");
+    public static final Charset CHARSET = StandardCharsets.UTF_8;
     protected String db;
     protected String currentSql;
     protected SQLRouter router;
@@ -47,9 +50,6 @@ public class RequestPreparedStatement implements java.sql.PreparedStatement {
     private void checkNull() throws SQLException {
         if (db == null) {
             throw new SQLException("db is null");
-        }
-        if (currentSql == null) {
-            throw new SQLException("sql is null");
         }
         if (router == null) {
             throw new SQLException("SQLRouter is null");
@@ -105,7 +105,7 @@ public class RequestPreparedStatement implements java.sql.PreparedStatement {
         Status status = new Status();
         com._4paradigm.openmldb.ResultSet resultSet = router.ExecuteSQLRequest(db, currentSql, currentRow, status);
         if (resultSet == null || status.getCode() != 0) {
-            String msg = status.getMsg();
+            String msg = status.ToString();
             status.delete();
             if (resultSet != null) {
                 resultSet.delete();
@@ -113,7 +113,7 @@ public class RequestPreparedStatement implements java.sql.PreparedStatement {
             throw new SQLException("execute sql fail, msg: " + msg);
         }
         status.delete();
-        SQLResultSet rs = new SQLResultSet(resultSet);
+        SQLResultSet rs = new NativeResultSet(resultSet);
         if (closeOnComplete) {
             closed = true;
         }
@@ -214,7 +214,7 @@ public class RequestPreparedStatement implements java.sql.PreparedStatement {
             setNull(i);
             return;
         }
-        byte bytes[] = s.getBytes(CHARSET);
+        byte[] bytes = s.getBytes(CHARSET);
         stringsLen.put(i, bytes.length);
         hasSet.set(i - 1, true);
         currentDatas.set(i - 1, bytes);
@@ -398,7 +398,7 @@ public class RequestPreparedStatement implements java.sql.PreparedStatement {
     public ResultSetMetaData getMetaData() throws SQLException {
         checkClosed();
         checkNull();
-        return new SQLResultSetMetaData(this.currentSchema);
+        return new SQLResultSetMetaData(Common.convertSchema(this.currentSchema));
     }
 
     @Override

@@ -13,8 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <utility>
+
 #include "testing/toydb_engine_test_base.h"
+
+#include "gflags/gflags.h"
 
 DEFINE_string(yaml_path, "", "Yaml filepath to load cases from");
 DEFINE_string(runner_mode, "batch",
@@ -27,7 +29,7 @@ DEFINE_bool(
 DEFINE_bool(enable_expr_opt, true,
             "Specify whether do expression optimization");
 DEFINE_int32(run_iters, 0, "Measure the approximate run time if specified");
-DEFINE_int32(case_id, -1, "Specify the case id to run and skip others");
+DEFINE_string(case_id, "", "Specify the case id to run and skip others");
 
 // jit options
 DEFINE_bool(enable_mcjit, false, "Use llvm legacy mcjit engine");
@@ -61,12 +63,14 @@ int DoRunEngine(const SqlCase& sql_case, const EngineOptions& options,
 
 int RunSingle(const std::string& yaml_path) {
     std::vector<SqlCase> cases;
-    if (!SqlCase::CreateSqlCasesFromYaml("", yaml_path, cases)) {
+    // TODO(ace): it become impossible for those want to give case_dir as absolute path, because final case dir always
+    // prefixed with base dir. Should support both
+    if (!SqlCase::CreateSqlCasesFromYaml(SqlCase::SqlCaseBaseDir(), yaml_path, cases)) {
         LOG(WARNING) << "Load cases from " << yaml_path << " failed";
         return ENGINE_TEST_RET_INVALID_CASE;
     }
     EngineOptions options;
-    options.SetClusterOptimized(FLAGS_cluster_mode == "cluster");
+    options.SetClusterOptimized(absl::EqualsIgnoreCase(FLAGS_cluster_mode, "cluster"));
     options.SetBatchRequestOptimized(FLAGS_enable_batch_request_opt);
     options.SetEnableExprOptimize(FLAGS_enable_expr_opt);
     JitOptions& jit_options = options.jit_options();
@@ -76,18 +80,18 @@ int RunSingle(const std::string& yaml_path) {
     jit_options.SetEnablePerf(FLAGS_enable_perf);
 
     for (auto& sql_case : cases) {
-        if (FLAGS_case_id >= 0 &&
-            std::to_string(FLAGS_case_id) != sql_case.id()) {
+        if (!FLAGS_case_id.empty() && FLAGS_case_id != sql_case.id()) {
             continue;
         }
-        EngineMode mode;
-        if (FLAGS_runner_mode == "batch") {
-            mode = kBatchMode;
-        } else if (FLAGS_runner_mode == "request") {
-            mode = kRequestMode;
+        EngineMode default_mode;
+        if (absl::EqualsIgnoreCase(FLAGS_runner_mode, "batch")) {
+            default_mode = kBatchMode;
+        } else if (absl::EqualsIgnoreCase(FLAGS_runner_mode, "request")) {
+            default_mode = kRequestMode;
         } else {
-            mode = kBatchRequestMode;
+            default_mode = kBatchRequestMode;
         }
+        auto mode = Engine::TryDetermineEngineMode(sql_case.sql_str_, default_mode);
         int ret = DoRunEngine(sql_case, options, mode);
         if (ret != ENGINE_TEST_RET_SUCCESS) {
             return ret;
@@ -101,8 +105,7 @@ int RunSingle(const std::string& yaml_path) {
 
 int main(int argc, char** argv) {
     ::google::ParseCommandLineFlags(&argc, &argv, false);
-    InitializeNativeTarget();
-    InitializeNativeTargetAsmPrinter();
+    ::hybridse::vm::Engine::InitializeGlobalLLVM();
     if (FLAGS_yaml_path != "") {
         return ::hybridse::vm::RunSingle(FLAGS_yaml_path);
     } else {

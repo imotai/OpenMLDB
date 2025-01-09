@@ -17,9 +17,6 @@
 #ifndef HYBRIDSE_INCLUDE_NODE_NODE_ENUM_H_
 #define HYBRIDSE_INCLUDE_NODE_NODE_ENUM_H_
 
-#include <string>
-#include "proto/fe_common.pb.h"
-#include "proto/fe_type.pb.h"
 namespace hybridse {
 namespace node {
 
@@ -82,6 +79,7 @@ enum SqlNodeType {
     kPartitionMeta,
     kReplicaNum,
     kDistributions,
+    kStorageMode,
     kCreateSpStmt,
     kInputParameter,
     kPartitionNum,
@@ -90,7 +88,25 @@ enum SqlNodeType {
     kDeployStmt,
     kSetStmt,
     kDeleteStmt,
-    kUnknow = -1
+    kCreateFunctionStmt,
+    kDynamicUdfFnDef,
+    kDynamicUdafFnDef,  // deprecated
+    kWithClauseEntry,
+    kAlterTableStmt,
+    kShowStmt,
+    kCompressType,
+    kColumnSchema,
+    kCreateUserStmt,
+    kAlterUserStmt,
+    kGrantStmt,
+    kRevokeStmt,
+    kCallStmt,
+    kSqlNodeTypeLast,  // debug type
+    kVariadicUdfDef,
+};
+
+enum class ShowStmtType {
+    kJobs,
 };
 
 enum TableRefType {
@@ -100,12 +116,13 @@ enum TableRefType {
 };
 
 enum QueryType {
-    kQuerySelect,
+    kQuerySelect = 0,
     kQuerySub,
-    kQueryUnion,
+    kQuerySetOperation,
 };
 enum ExprType {
-    kExprBinary,
+    kExprUnknow = -1,
+    kExprBinary = 0,
     kExprUnary,
     kExprBetween,
     kExprCall,
@@ -129,11 +146,19 @@ enum ExprType {
     kExprCond,
     kExprIn,
     kExprEscaped,
-    kExprUnknow = -1
+    kExprArray,
+    kExprArrayElement,      // extract value from a array or map, with `[]` operator
+    kExprStructCtorParens,  // (expr1, expr2, ...)
+    kExprFake,              // not a real one
+    kExprLast = kExprFake,
 };
+
 // typedef hybridse::type::Type DataType;
+// TODO(ace): separate DataType into two group
+//   - group 1: bool ~ list, map ~ array: those types are built in codegen
+//   - group2: hour/minute/second/day, only appear in plan node level
 enum DataType {
-    kBool,
+    kBool = 0,
     kInt16,
     kInt32,
     kInt64,
@@ -142,7 +167,7 @@ enum DataType {
     kVarchar,
     kDate,
     kTimestamp,
-    kList,
+    kList,  // dynamic sized, same element type, not nullable. usually ref to column ref or subquery
     kHour,
     kMinute,
     kSecond,
@@ -152,8 +177,25 @@ enum DataType {
     kInt8Ptr,
     kRow,
     kOpaque,
-    kTuple,
+    kTuple,         // heterogeneous element type, fixed size
+    kArray,         // fixed size. In SQL: [1, 2, 3] or ARRAY<int>[1, 2, 3]
+    kDataTypeFake,  // not a data type, for testing purpose only
+    kLastDataType = kDataTypeFake,
+
+    // the tree type are not moved above kLastDataType for compatibility
+    // it may necessary to do it in the further
+
+    // kVoid
+    //  A distinct data type: signifies no value or meaningful result.
+    //  Typically used for function that does not returns value.
     kVoid = 100,
+    // kNull
+    //   A special marker representing the absence of a value.
+    //   Not a true data type but a placeholder for missing or unknown information.
+    //   A `NULL` literal can be eventually resolved to:
+    //     - NULL of void type, if no extra info provided: 'SELECT NULL'
+    //     - NULL of int (or any other) type, extra information provided, e.g with 'CAST' operator
+    //         'SELECT CAST(NULL as INT)'
     kNull = 101,
     kPlaceholder = 102
 };
@@ -173,8 +215,8 @@ enum FnOperator {
     kFnOpAdd,         // "+"
     kFnOpMinus,       // "-"
     kFnOpMulti,       // "*"
-    kFnOpDiv,         // "/"
-    kFnOpFDiv,        // "div", float division
+    kFnOpDiv,         // "DIV", integer division
+    kFnOpFDiv,        // "/", float division
     kFnOpMod,         // "%"
     kFnOpAnd,         // "AND", logical
     kFnOpOr,          // "OR" , logical
@@ -189,11 +231,12 @@ enum FnOperator {
     kFnOpDot,         // "."
     kFnOpAt,          // "[]"
     kFnOpLike,        // "LIKE"
-    kFnOpILike,        // "ILIKE"
+    kFnOpILike,       // "ILIKE"
+    kFnOpRLike,       // "RLIKE"
     kFnOpIn,          // "IN"
     kFnOpBracket,     // "()"
     kFnOpIsNull,      // "is_null"
-    kFnOpNonNull,     // ""
+    kFnOpNonNull,     // "" a helper op for compile to ignore null check
     kFnOpNone,        // "NONE"
     kFnOpBitwiseAnd,  // "&"
     kFnOpBitwiseOr,   // "|"
@@ -227,13 +270,16 @@ enum JoinType {
     kJoinTypeRight,
     kJoinTypeInner,
     kJoinTypeConcat,
-    kJoinTypeComma
+    kJoinTypeCross,  // AKA commma join
 };
 
-enum UnionType { kUnionTypeDistinct, kUnionTypeAll };
-
+enum class SetOperationType {
+    UNION,
+    EXCEPT,
+    INTERSECT,
+};
 enum CmdType {
-    kCmdCreateDatabase,
+    kCmdCreateDatabase = 0,
     kCmdUseDatabase,
     kCmdShowDatabases,
     kCmdShowTables,
@@ -254,7 +300,17 @@ enum CmdType {
     kCmdStopJob,
     kCmdShowGlobalVariables,
     kCmdShowSessionVariables,
-    kCmdUnknown = -1
+    kCmdShowComponents,
+    kCmdShowTableStatus,
+    kCmdShowFunctions,
+    kCmdDropFunction,
+    kCmdShowJobLog,
+    kCmdShowCreateTable,
+    kCmdTruncate,
+    kCmdDropUser,
+    kCmdShowUser,
+    kCmdFake,  // not a real cmd, for testing purpose only
+    kLastCmd = kCmdFake,
 };
 enum ExplainType {
     kExplainLogical,
@@ -271,7 +327,7 @@ enum PlanType {
     kPlanTypeFilter,
     kPlanTypeTable,
     kPlanTypeJoin,
-    kPlanTypeUnion,
+    kPlanTypeSetOperation,
     kPlanTypeSort,
     kPlanTypeGroup,
     kPlanTypeDistinct,
@@ -287,6 +343,15 @@ enum PlanType {
     kPlanTypeDeploy,
     kPlanTypeSet,
     kPlanTypeDelete,
+    kPlanTypeCreateFunction,
+    kPlanTypeWithClauseEntry,
+    kPlanTypeAlterTable,
+    kPlanTypeShow,
+    kPlanTypeCreateUser,
+    kPlanTypeAlterUser,
+    kPlanTypeGrant,
+    kPlanTypeRevoke,
+    kPlanTypeCallStmt,
     kUnknowPlan = -1,
 };
 
@@ -298,6 +363,18 @@ enum TTLType {
 enum VariableScope {
     kGlobalSystemVariable,
     kSessionSystemVariable,
+};
+
+enum StorageMode {
+    kUnknown = 0,
+    kMemory = 1,
+    kSSD = 2,
+    kHDD = 3,
+};
+
+enum CompressType {
+    kNoCompress = 0,
+    kSnappy = 1,
 };
 
 // batch plan node type
